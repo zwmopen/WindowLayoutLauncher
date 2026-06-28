@@ -1,0 +1,18 @@
+# 备份文件
+*_backup.exe
+*_old.exe
+*_v1.exe
+*_v2.exe
+update.bat
+
+# 用户布局数据（保留示例）
+release/layouts/*.json
+
+# 日志文件
+release/logs/*.log
+
+# 更新检查记录
+last_update_check.txt
+
+# 导出文件
+release/exports/*.json

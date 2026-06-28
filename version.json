@@ -1,0 +1,6 @@
+{
+    "version": "2.0.0",
+    "download_url": "https://github.com/mingge/WindowLayoutLauncher/releases/download/v2.0.0/窗口布局启动器.exe",
+    "release_notes": "v2.0.0 更新内容:\n\n1. 修复 exe_path 为空时无法匹配已运行窗口的问题\n2. 新增 UWP 应用启动支持（如 Codex）\n3. 修复最小化窗口无法恢复的问题\n4. 新增恢复失败详情日志\n5. 新增关于页面和自动更新功能\n6. 延长窗口等待超时时间",
+    "published_at": "2026-06-28"
+}
