@@ -1,0 +1,48 @@
+name: Release Windows app
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate tag and version metadata
+        shell: powershell
+        run: |
+          $metadata = Get-Content -LiteralPath "version.json" -Raw -Encoding UTF8 | ConvertFrom-Json
+          $tagVersion = $env:GITHUB_REF_NAME.TrimStart('v')
+          if ($metadata.version -ne $tagVersion) {
+            throw "Tag version $tagVersion does not match version.json $($metadata.version)."
+          }
+
+      - name: Build application
+        shell: powershell
+        run: .\build.ps1
+
+      - name: Create checksum
+        shell: powershell
+        run: |
+          $exe = Join-Path $PWD "release\窗口布局启动器.exe"
+          $hash = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  窗口布局启动器.exe" | Set-Content -LiteralPath "release\SHA256SUMS.txt" -Encoding UTF8
+          Get-Content -LiteralPath "release\SHA256SUMS.txt"
+
+      - name: Publish GitHub Release
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create $env:GITHUB_REF_NAME `
+            --title "窗口布局启动器 $env:GITHUB_REF_NAME" `
+            --generate-notes `
+            "release\窗口布局启动器.exe" `
+            "release\SHA256SUMS.txt"
