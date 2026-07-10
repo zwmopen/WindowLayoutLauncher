@@ -14,6 +14,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Verify release contract
+        shell: powershell
+        run: .\tests\verify-release-contract.ps1
+
       - name: Build application
         shell: powershell
         run: .\build.ps1
