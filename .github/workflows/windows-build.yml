@@ -1,0 +1,28 @@
+name: Windows build
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build application
+        shell: powershell
+        run: .\build.ps1
+
+      - name: Verify executable
+        shell: powershell
+        run: |
+          $exe = Join-Path $PWD "release\窗口布局启动器.exe"
+          if (-not (Test-Path -LiteralPath $exe)) {
+            throw "Build did not produce: $exe"
+          }
+          Get-Item -LiteralPath $exe | Format-List Name, Length, LastWriteTime
