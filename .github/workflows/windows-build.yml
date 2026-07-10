@@ -26,3 +26,12 @@ jobs:
             throw "Build did not produce: $exe"
           }
           Get-Item -LiteralPath $exe | Format-List Name, Length, LastWriteTime
+
+      - name: Verify build did not modify tracked files
+        shell: powershell
+        run: |
+          $changes = git status --short
+          if ($changes) {
+            Write-Host $changes
+            throw "Build modified tracked files or created unexpected repository files."
+          }
