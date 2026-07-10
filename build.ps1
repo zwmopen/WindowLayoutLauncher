@@ -1,10 +1,22 @@
-﻿$ErrorActionPreference = "Stop"
+﻿param(
+    [string]$OutputPath = ""
+)
+
+$ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $src = Join-Path $root "src\WindowLayoutLauncher.cs"
 $icon = Join-Path $root "assets\app.ico"
-$release = Join-Path $root "release"
-$out = Join-Path $release "窗口布局启动器.exe"
+$defaultRelease = Join-Path $root "release"
+
+if ([string]::IsNullOrWhiteSpace($OutputPath)) {
+    $out = Join-Path $defaultRelease "窗口布局启动器.exe"
+} elseif ([System.IO.Path]::IsPathRooted($OutputPath)) {
+    $out = [System.IO.Path]::GetFullPath($OutputPath)
+} else {
+    $out = [System.IO.Path]::GetFullPath((Join-Path $root $OutputPath))
+}
+
 $csc = "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
 
 if (-not (Test-Path -LiteralPath $csc)) {
@@ -23,7 +35,8 @@ if (-not (Test-Path -LiteralPath $icon)) {
     throw "Cannot find app icon: $icon"
 }
 
-New-Item -ItemType Directory -Force -Path $release | Out-Null
+$outputDirectory = Split-Path -Parent $out
+New-Item -ItemType Directory -Force -Path $outputDirectory | Out-Null
 
 # Older source snapshots may still contain a placeholder repository address.
 # Normalize those values in a temporary generated file so a build never edits
