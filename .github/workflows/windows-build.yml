@@ -18,18 +18,20 @@ jobs:
         shell: powershell
         run: .\tests\verify-release-contract.ps1
 
-      - name: Build application
+      - name: Build application outside repository
         shell: powershell
-        run: .\build.ps1
+        run: |
+          $exe = Join-Path $env:RUNNER_TEMP "WindowLayoutLauncher-ci.exe"
+          .\build.ps1 -OutputPath $exe
+          "CI_EXE=$exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Verify executable
         shell: powershell
         run: |
-          $exe = Join-Path $PWD "release\窗口布局启动器.exe"
-          if (-not (Test-Path -LiteralPath $exe)) {
-            throw "Build did not produce: $exe"
+          if (-not (Test-Path -LiteralPath $env:CI_EXE)) {
+            throw "Build did not produce: $env:CI_EXE"
           }
-          Get-Item -LiteralPath $exe | Format-List Name, Length, LastWriteTime
+          Get-Item -LiteralPath $env:CI_EXE | Format-List Name, Length, LastWriteTime
 
       - name: Verify build did not modify tracked files
         shell: powershell
