@@ -13,7 +13,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Validate tag and version metadata
         shell: powershell
@@ -24,25 +24,41 @@ jobs:
             throw "Tag version $tagVersion does not match version.json $($metadata.version)."
           }
 
-      - name: Build application
+      - name: Build release files outside repository
         shell: powershell
-        run: .\build.ps1
+        run: |
+          $releaseDir = Join-Path $env:RUNNER_TEMP "WindowLayoutLauncher-release"
+          New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
+          $exe = Join-Path $releaseDir "窗口布局启动器.exe"
+          .\build.ps1 -OutputPath $exe
+          "RELEASE_DIR=$releaseDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Create checksum
         shell: powershell
         run: |
-          $exe = Join-Path $PWD "release\窗口布局启动器.exe"
+          $exe = Join-Path $env:RELEASE_DIR "窗口布局启动器.exe"
+          $checksum = Join-Path $env:RELEASE_DIR "SHA256SUMS.txt"
           $hash = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$hash  窗口布局启动器.exe" | Set-Content -LiteralPath "release\SHA256SUMS.txt" -Encoding UTF8
-          Get-Content -LiteralPath "release\SHA256SUMS.txt"
+          "$hash  窗口布局启动器.exe" | Set-Content -LiteralPath $checksum -Encoding UTF8
+          Get-Content -LiteralPath $checksum
 
-      - name: Publish GitHub Release
+      - name: Publish or repair GitHub Release
         shell: powershell
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create $env:GITHUB_REF_NAME `
-            --title "窗口布局启动器 $env:GITHUB_REF_NAME" `
-            --generate-notes `
-            "release\窗口布局启动器.exe" `
-            "release\SHA256SUMS.txt"
+          $tag = $env:GITHUB_REF_NAME
+          $exe = Join-Path $env:RELEASE_DIR "窗口布局启动器.exe"
+          $checksum = Join-Path $env:RELEASE_DIR "SHA256SUMS.txt"
+
+          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag $exe $checksum --clobber --repo $env:GITHUB_REPOSITORY
+          } else {
+            gh release create $tag `
+              --repo $env:GITHUB_REPOSITORY `
+              --title "窗口布局启动器 $tag" `
+              --generate-notes `
+              $exe `
+              $checksum
+          }
