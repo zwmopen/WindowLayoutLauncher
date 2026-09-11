@@ -1,6 +1,6 @@
 {
-    "version": "2.0.0",
-    "download_url": "https://github.com/zwmopen/WindowLayoutLauncher/releases/download/v2.0.0/窗口布局启动器.exe",
-    "release_notes": "v2.0.0 更新内容:\n\n1. 修复 exe_path 为空时无法匹配已运行窗口的问题\n2. 新增 UWP 应用启动支持（如 Codex）\n3. 修复最小化窗口无法恢复的问题\n4. 新增恢复失败详情日志\n5. 新增关于页面和自动更新功能\n6. 延长窗口等待超时时间",
-    "published_at": "2026-06-28"
+    "version": "2.1.0",
+    "download_url": "https://github.com/zwmopen/WindowLayoutLauncher/releases/download/v2.1.0/窗口布局启动器.exe",
+    "release_notes": "v2.1.0 更新内容:\n\n1. 新增程序内日志与诊断查看器，可直接读取恢复、崩溃和更新日志\n2. 恢复布局日志增加毫秒级文件名与结构化运行记录，避免同秒覆盖\n3. 更新检查和下载移到后台线程，网络波动不再卡住主界面\n4. 更新文件增加 GitHub 地址校验、MZ 文件校验与可选 SHA-256 校验\n5. 更新替换改为带时间戳备份，失败时自动回滚并保留备份\n6. 修正源码中的正式仓库地址，并补齐稳定版/开发版双入口",
+    "published_at": "2026-09-11"
 }

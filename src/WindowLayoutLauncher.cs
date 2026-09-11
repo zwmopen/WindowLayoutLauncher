@@ -8,6 +8,7 @@ using System.Drawing.Drawing2D;
 using System.Runtime.InteropServices;
 using System.Runtime.Serialization;
 using System.Runtime.Serialization.Json;
+using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 using System.Windows.Forms;
@@ -16,14 +17,15 @@ namespace WindowLayoutLauncher
 {
     static class Program
     {
-        public const string Version = "2.0.0";
+        public const string Version = "2.1.0";
         public const string AppName = "窗口布局启动器";
-        public const string RepoUrl = "https://github.com/yourusername/WindowLayoutLauncher";
-        public const string VersionCheckUrl = "https://raw.githubusercontent.com/yourusername/WindowLayoutLauncher/main/version.json";
+        public const string RepoUrl = "https://github.com/zwmopen/WindowLayoutLauncher";
+        public const string VersionCheckUrl = "https://raw.githubusercontent.com/zwmopen/WindowLayoutLauncher/main/version.json";
 
         [STAThread]
         static void Main(string[] args)
         {
+            AppLogger.Initialize(AppDomain.CurrentDomain.BaseDirectory);
             try
             {
                 TrySetDpiAwareness();
@@ -44,7 +46,7 @@ namespace WindowLayoutLauncher
                 WriteCrashLog(ex);
                 if (args.Length == 0)
                 {
-                    MessageBox.Show("窗口布局启动器遇到错误，已写入 crash.log。", "窗口布局启动器", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    MessageBox.Show("窗口布局启动器遇到错误，已写入 logs 目录。", "窗口布局启动器", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 }
             }
         }
@@ -53,7 +55,9 @@ namespace WindowLayoutLauncher
         {
             try
             {
-                var path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "crash.log");
+                var logDir = AppLogger.LogsDirectory;
+                Directory.CreateDirectory(logDir);
+                var path = Path.Combine(logDir, "crash_" + DateTime.Now.ToString("yyyyMMdd_HHmmss_fff") + ".log");
                 var lines = new List<string>();
                 lines.Add(DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
                 lines.Add(ex == null ? "null exception" : ex.GetType().FullName);
@@ -67,6 +71,7 @@ namespace WindowLayoutLauncher
                     lines.Add(ex.InnerException.StackTrace);
                 }
                 File.WriteAllLines(path, lines.ToArray(), Encoding.UTF8);
+                AppLogger.Write("ERROR", "crash", ex == null ? "null exception" : ex.ToString());
             }
             catch
             {
@@ -91,6 +96,74 @@ namespace WindowLayoutLauncher
             catch
             {
             }
+        }
+    }
+
+    public static class AppLogger
+    {
+        private static readonly object Sync = new object();
+        private static string baseDir = AppDomain.CurrentDomain.BaseDirectory;
+
+        public static string LogsDirectory
+        {
+            get { return Path.Combine(baseDir, "logs"); }
+        }
+
+        public static void Initialize(string root)
+        {
+            if (!string.IsNullOrWhiteSpace(root))
+            {
+                baseDir = Path.GetFullPath(root);
+            }
+
+            try
+            {
+                Directory.CreateDirectory(LogsDirectory);
+            }
+            catch
+            {
+            }
+        }
+
+        public static void Write(string level, string eventName, string message)
+        {
+            try
+            {
+                var line = "{\"timestamp\":\"" + Escape(DateTime.Now.ToString("o")) +
+                    "\",\"level\":\"" + Escape(level) +
+                    "\",\"event\":\"" + Escape(eventName) +
+                    "\",\"message\":\"" + Escape(message) + "\"}";
+                lock (Sync)
+                {
+                    Directory.CreateDirectory(LogsDirectory);
+                    var path = Path.Combine(LogsDirectory, "app_" + DateTime.Now.ToString("yyyyMMdd") + ".jsonl");
+                    File.AppendAllText(path, line + Environment.NewLine, new UTF8Encoding(false));
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        private static string Escape(string value)
+        {
+            if (value == null) return "";
+            var builder = new StringBuilder(value.Length + 16);
+            foreach (var ch in value)
+            {
+                switch (ch)
+                {
+                    case '\\': builder.Append("\\\\"); break;
+                    case '"': builder.Append("\\\""); break;
+                    case '\r': builder.Append("\\r"); break;
+                    case '\n': builder.Append("\\n"); break;
+                    case '\t': builder.Append("\\t"); break;
+                    default:
+                        if (ch < 32) builder.Append(' '); else builder.Append(ch);
+                        break;
+                }
+            }
+            return builder.ToString();
         }
     }
 
@@ -159,6 +232,23 @@ namespace WindowLayoutLauncher
         }
     }
 
+    public class LogSummary
+    {
+        public string Name { get; set; }
+        public string Path { get; set; }
+        public DateTime ModifiedAt { get; set; }
+        public long Length { get; set; }
+
+        public string Display
+        {
+            get
+            {
+                var size = Length < 1024 ? Length + " B" : (Length / 1024.0).ToString("0.0") + " KB";
+                return Name + "    " + ModifiedAt.ToString("MM-dd HH:mm") + "    " + size;
+            }
+        }
+    }
+
     public class WindowInfo
     {
         public IntPtr Hwnd { get; set; }
@@ -187,14 +277,19 @@ namespace WindowLayoutLauncher
     {
         private readonly string baseDir;
         private readonly string layoutDir;
+        private readonly string logDir;
 
         public string LayoutDir { get { return layoutDir; } }
+        public string LogsDir { get { return logDir; } }
 
         public LayoutManager(string baseDir)
         {
-            this.baseDir = baseDir;
+            this.baseDir = System.IO.Path.GetFullPath(baseDir);
             layoutDir = System.IO.Path.Combine(baseDir, "layouts");
+            logDir = System.IO.Path.Combine(this.baseDir, "logs");
+            AppLogger.Initialize(this.baseDir);
             Directory.CreateDirectory(layoutDir);
+            Directory.CreateDirectory(logDir);
         }
 
         public List<LayoutSummary> GetLayouts()
@@ -214,11 +309,72 @@ namespace WindowLayoutLauncher
                         Count = layout.Items == null ? 0 : layout.Items.Count
                     });
                 }
-                catch
+                catch (Exception ex)
                 {
+                    AppLogger.Write("WARN", "layout_read_failed", file + " | " + ex.Message);
                 }
             }
             return result;
+        }
+
+        public List<LogSummary> GetLogs()
+        {
+            Directory.CreateDirectory(logDir);
+            var result = new List<LogSummary>();
+            var files = Directory.GetFiles(logDir, "*.log")
+                .Concat(Directory.GetFiles(logDir, "*.jsonl"))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Select(path => new FileInfo(path))
+                .OrderByDescending(file => file.LastWriteTimeUtc)
+                .ThenByDescending(file => file.Name, StringComparer.OrdinalIgnoreCase)
+                .Take(100);
+
+            foreach (var file in files)
+            {
+                result.Add(new LogSummary
+                {
+                    Name = file.Name,
+                    Path = file.FullName,
+                    ModifiedAt = file.LastWriteTime,
+                    Length = file.Length
+                });
+            }
+            return result;
+        }
+
+        public string ReadLog(string path)
+        {
+            if (string.IsNullOrWhiteSpace(path)) throw new InvalidOperationException("没有选择日志文件。");
+
+            var fullPath = System.IO.Path.GetFullPath(path);
+            var root = logDir.TrimEnd(System.IO.Path.DirectorySeparatorChar, System.IO.Path.AltDirectorySeparatorChar) + System.IO.Path.DirectorySeparatorChar;
+            if (!fullPath.StartsWith(root, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException("只能读取应用日志目录中的文件。");
+            }
+            if (!File.Exists(fullPath)) throw new FileNotFoundException("日志文件不存在。", fullPath);
+
+            const int maxChars = 600000;
+            using (var reader = new StreamReader(fullPath, Encoding.UTF8, true))
+            {
+                var buffer = new char[8192];
+                var builder = new StringBuilder();
+                int read;
+                while ((read = reader.Read(buffer, 0, buffer.Length)) > 0)
+                {
+                    if (builder.Length + read > maxChars)
+                    {
+                        builder.Append(buffer, 0, maxChars - builder.Length);
+                        builder.AppendLine();
+                        builder.Append("[日志过长，仅显示前 ");
+                        builder.Append(maxChars);
+                        builder.Append(" 个字符]");
+                        break;
+                    }
+                    builder.Append(buffer, 0, read);
+                }
+                return builder.ToString();
+            }
         }
 
         public LayoutConfig SaveCurrent(string name)
@@ -301,10 +457,27 @@ namespace WindowLayoutLauncher
             var path = File.Exists(nameOrPath) ? nameOrPath : GetLayoutPath(SafeName(nameOrPath));
             if (!File.Exists(path))
             {
+                AppLogger.Write("WARN", "restore_missing_layout", path);
                 return new RestoreResult { Ok = 0, Failed = 1, Message = "没有找到这个布局", FailDetails = new List<string> { "布局文件不存在: " + path } };
             }
 
-            var layout = ReadLayout(path);
+            LayoutConfig layout;
+            try
+            {
+                layout = ReadLayout(path);
+            }
+            catch (Exception ex)
+            {
+                AppLogger.Write("ERROR", "restore_layout_read_failed", path + " | " + ex.Message);
+                return new RestoreResult
+                {
+                    Ok = 0,
+                    Failed = 1,
+                    Message = "布局读取失败",
+                    FailDetails = new List<string> { path + " → " + ex.Message }
+                };
+            }
+
             var topWindows = WindowTools.GetTopLevelWindows();
             var explorerWindows = WindowTools.GetExplorerWindows(topWindows, true);
             var used = new HashSet<IntPtr>();
@@ -313,8 +486,9 @@ namespace WindowLayoutLauncher
             var failDetails = new List<string>();
             var logLines = new List<string>();
             logLines.Add("===== 恢复布局: " + (layout.Name ?? Path.GetFileNameWithoutExtension(path)) + " =====");
-            logLines.Add("时间: " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
+            logLines.Add("时间: " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff"));
             logLines.Add("");
+            AppLogger.Write("INFO", "restore_started", (layout.Name ?? Path.GetFileNameWithoutExtension(path)) + " | items=" + (layout.Items == null ? 0 : layout.Items.Count));
 
             int idx = 0;
             foreach (var item in layout.Items ?? new List<LayoutItem>())
@@ -382,10 +556,14 @@ namespace WindowLayoutLauncher
             {
                 var logDir = Path.Combine(baseDir, "logs");
                 Directory.CreateDirectory(logDir);
-                var logPath = Path.Combine(logDir, "restore_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".log");
+                var logPath = Path.Combine(logDir, "restore_" + DateTime.Now.ToString("yyyyMMdd_HHmmss_fff") + ".log");
                 File.WriteAllLines(logPath, logLines.ToArray(), Encoding.UTF8);
+                AppLogger.Write("INFO", "restore_finished", (layout.Name ?? Path.GetFileNameWithoutExtension(path)) + " | ok=" + ok + " | failed=" + failed + " | log=" + logPath);
             }
-            catch { }
+            catch (Exception ex)
+            {
+                AppLogger.Write("ERROR", "restore_log_write_failed", ex.Message);
+            }
 
             return new RestoreResult
             {
@@ -1260,7 +1438,7 @@ namespace WindowLayoutLauncher
             AutoScaleMode = AutoScaleMode.None;
             Text = "窗口布局启动器";
             StartPosition = FormStartPosition.CenterScreen;
-            ClientSize = new Size(760, 560);
+            ClientSize = new Size(760, 600);
             MinimumSize = new Size(620, 460);
             BackColor = UiTheme.WindowBottom;
             Font = new Font("Microsoft YaHei UI", 9F);
@@ -1349,7 +1527,7 @@ namespace WindowLayoutLauncher
             actions.RowStyles.Add(new RowStyle(SizeType.Absolute, 14F));
             actions.RowStyles.Add(new RowStyle(SizeType.Absolute, 92F));
             actions.RowStyles.Add(new RowStyle(SizeType.Absolute, 14F));
-            actions.RowStyles.Add(new RowStyle(SizeType.Absolute, 92F));
+            actions.RowStyles.Add(new RowStyle(SizeType.Absolute, 128F));
             actions.RowStyles.Add(new RowStyle(SizeType.Absolute, 14F));
             actions.RowStyles.Add(new RowStyle(SizeType.Absolute, 56F));
             body.Controls.Add(actions, 1, 0);
@@ -1374,8 +1552,8 @@ namespace WindowLayoutLauncher
             actions.Controls.Add(shareGroup, 0, 4);
 
             var fileGroup = AddActionGroup(
-                new[] { "布局文件夹", "刷新" },
-                new EventHandler[] { (s, e) => Process.Start("explorer.exe", manager.LayoutDir), (s, e) => RefreshLayouts() });
+                new[] { "布局文件夹", "日志与诊断", "刷新" },
+                new EventHandler[] { (s, e) => Process.Start("explorer.exe", manager.LayoutDir), (s, e) => ShowLogs(), (s, e) => RefreshLayouts() });
             fileGroup.Dock = DockStyle.Fill;
             fileGroup.Margin = new Padding(0);
             actions.Controls.Add(fileGroup, 0, 6);
@@ -1428,35 +1606,56 @@ namespace WindowLayoutLauncher
 
                 if (!shouldCheck) return;
 
-                string error;
-                var info = UpdateChecker.CheckForUpdate(out error);
-                if (info == null) return;
-
-                try
+                AppLogger.Write("INFO", "update_check_started", "automatic");
+                ThreadPool.QueueUserWorkItem(_ =>
                 {
-                    File.WriteAllText(lastCheckPath, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
-                }
-                catch { }
-
-                if (!UpdateChecker.IsNewerVersion(info.Version, Program.Version)) return;
-
-                var result = MessageBox.Show(this,
-                    "发现新版本 v" + info.Version + "\n\n" +
-                    (info.ReleaseNotes ?? "暂无更新说明") + "\n\n" +
-                    "是否立即更新？",
-                    "发现新版本 - " + Program.AppName,
-                    MessageBoxButtons.YesNo,
-                    MessageBoxIcon.Information);
-
-                if (result == DialogResult.Yes)
-                {
-                    using (var about = new AboutForm())
+                    string error;
+                    var info = UpdateChecker.CheckForUpdate(out error);
+                    try
                     {
-                        about.ShowDialog(this);
+                        File.WriteAllText(lastCheckPath, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
                     }
-                }
+                    catch (Exception writeEx)
+                    {
+                        AppLogger.Write("WARN", "update_check_stamp_failed", writeEx.Message);
+                    }
+
+                    if (info == null)
+                    {
+                        AppLogger.Write("WARN", "update_check_failed", error ?? "unknown");
+                        return;
+                    }
+
+                    AppLogger.Write("INFO", "update_check_finished", "remote=" + info.Version);
+                    if (!UpdateChecker.IsNewerVersion(info.Version, Program.Version)) return;
+
+                    try
+                    {
+                        BeginInvoke((Action)(() =>
+                        {
+                            var result = MessageBox.Show(this,
+                                "发现新版本 v" + info.Version + "\n\n" +
+                                (info.ReleaseNotes ?? "暂无更新说明") + "\n\n" +
+                                "是否立即更新？",
+                                "发现新版本 - " + Program.AppName,
+                                MessageBoxButtons.YesNo,
+                                MessageBoxIcon.Information);
+
+                            if (result == DialogResult.Yes)
+                            {
+                                using (var about = new AboutForm()) about.ShowDialog(this);
+                            }
+                        }));
+                    }
+                    catch
+                    {
+                    }
+                });
             }
-            catch { }
+            catch (Exception ex)
+            {
+                AppLogger.Write("WARN", "update_check_schedule_failed", ex.Message);
+            }
         }
 
         private void ShowAbout()
@@ -1464,6 +1663,14 @@ namespace WindowLayoutLauncher
             using (var about = new AboutForm())
             {
                 about.ShowDialog(this);
+            }
+        }
+
+        private void ShowLogs()
+        {
+            using (var logs = new LogViewerForm(manager))
+            {
+                logs.ShowDialog(this);
             }
         }
 
@@ -1815,6 +2022,178 @@ namespace WindowLayoutLauncher
         }
     }
 
+    public class LogViewerForm : Form
+    {
+        private readonly LayoutManager manager;
+        private ListBox logList;
+        private RichTextBox contentBox;
+        private Label statusLabel;
+
+        public LogViewerForm(LayoutManager manager)
+        {
+            this.manager = manager;
+            Initialize();
+            RefreshLogs();
+        }
+
+        private void Initialize()
+        {
+            AutoScaleMode = AutoScaleMode.None;
+            Text = "日志与诊断 - " + Program.AppName;
+            StartPosition = FormStartPosition.CenterParent;
+            Size = UiTheme.DpiSize(820, 560);
+            MinimumSize = UiTheme.DpiSize(680, 420);
+            Font = new Font("Microsoft YaHei UI", 9F);
+            BackColor = UiTheme.WindowBottom;
+
+            var root = new TableLayoutPanel();
+            root.Dock = DockStyle.Fill;
+            root.Padding = new Padding(18);
+            root.BackColor = Color.Transparent;
+            root.ColumnCount = 2;
+            root.RowCount = 2;
+            root.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 260F));
+            root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            root.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 34F));
+            Controls.Add(root);
+
+            var left = new GlassPanel();
+            left.Dock = DockStyle.Fill;
+            left.Padding = new Padding(12);
+            left.FillColor = UiTheme.Panel;
+            root.Controls.Add(left, 0, 0);
+
+            var leftLayout = new TableLayoutPanel();
+            leftLayout.Dock = DockStyle.Fill;
+            leftLayout.BackColor = Color.Transparent;
+            leftLayout.RowCount = 2;
+            leftLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 28F));
+            leftLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+            left.Controls.Add(leftLayout);
+
+            var leftTitle = new Label();
+            leftTitle.Text = "日志文件";
+            leftTitle.Dock = DockStyle.Fill;
+            leftTitle.Font = new Font("Microsoft YaHei UI", 10F, FontStyle.Bold);
+            leftTitle.ForeColor = UiTheme.Ink;
+            leftTitle.TextAlign = ContentAlignment.MiddleLeft;
+            leftTitle.BackColor = Color.Transparent;
+            leftLayout.Controls.Add(leftTitle, 0, 0);
+
+            logList = new ListBox();
+            logList.Dock = DockStyle.Fill;
+            logList.DisplayMember = "Display";
+            logList.BackColor = UiTheme.Panel;
+            logList.ForeColor = UiTheme.Ink;
+            logList.BorderStyle = BorderStyle.None;
+            logList.SelectedIndexChanged += (s, e) => LoadSelectedLog();
+            leftLayout.Controls.Add(logList, 0, 1);
+
+            var right = new GlassPanel();
+            right.Dock = DockStyle.Fill;
+            right.Padding = new Padding(12);
+            right.Margin = new Padding(12, 0, 0, 0);
+            right.FillColor = UiTheme.Panel;
+            root.Controls.Add(right, 1, 0);
+
+            contentBox = new RichTextBox();
+            contentBox.Dock = DockStyle.Fill;
+            contentBox.ReadOnly = true;
+            contentBox.WordWrap = false;
+            contentBox.Font = new Font("Consolas", 9F);
+            contentBox.BackColor = Color.FromArgb(248, 250, 252);
+            contentBox.ForeColor = UiTheme.Ink;
+            contentBox.BorderStyle = BorderStyle.None;
+            right.Controls.Add(contentBox);
+
+            var actions = new FlowLayoutPanel();
+            actions.Dock = DockStyle.Fill;
+            actions.BackColor = Color.Transparent;
+            actions.FlowDirection = FlowDirection.LeftToRight;
+            actions.WrapContents = false;
+            root.Controls.Add(actions, 0, 1);
+            root.SetColumnSpan(actions, 2);
+
+            var refreshButton = new GlassButton();
+            refreshButton.Text = "刷新日志";
+            refreshButton.Width = 100;
+            refreshButton.Height = 30;
+            refreshButton.Click += (s, e) => RefreshLogs();
+            actions.Controls.Add(refreshButton);
+
+            var folderButton = new GlassButton();
+            folderButton.Text = "打开日志文件夹";
+            folderButton.Width = 140;
+            folderButton.Height = 30;
+            folderButton.Click += (s, e) =>
+            {
+                try { Process.Start("explorer.exe", manager.LogsDir); }
+                catch (Exception ex) { statusLabel.Text = "打开文件夹失败：" + ex.Message; }
+            };
+            actions.Controls.Add(folderButton);
+
+            statusLabel = new Label();
+            statusLabel.AutoSize = true;
+            statusLabel.ForeColor = UiTheme.Muted;
+            statusLabel.BackColor = Color.Transparent;
+            statusLabel.Margin = new Padding(12, 8, 0, 0);
+            actions.Controls.Add(statusLabel);
+        }
+
+        private void RefreshLogs()
+        {
+            var selectedPath = (logList.SelectedItem as LogSummary == null) ? null : ((LogSummary)logList.SelectedItem).Path;
+            logList.Items.Clear();
+            try
+            {
+                foreach (var log in manager.GetLogs()) logList.Items.Add(log);
+                if (logList.Items.Count > 0)
+                {
+                    var selectedIndex = 0;
+                    for (int i = 0; i < logList.Items.Count; i++)
+                    {
+                        var item = logList.Items[i] as LogSummary;
+                        if (item != null && string.Equals(item.Path, selectedPath, StringComparison.OrdinalIgnoreCase))
+                        {
+                            selectedIndex = i;
+                            break;
+                        }
+                    }
+                    logList.SelectedIndex = selectedIndex;
+                }
+                else
+                {
+                    contentBox.Text = "暂无日志。完成一次恢复、检查更新或发生错误后，这里会显示诊断记录。";
+                }
+                statusLabel.Text = "共 " + logList.Items.Count + " 个日志文件";
+            }
+            catch (Exception ex)
+            {
+                contentBox.Text = ex.ToString();
+                statusLabel.Text = "读取日志列表失败";
+            }
+        }
+
+        private void LoadSelectedLog()
+        {
+            var selected = logList.SelectedItem as LogSummary;
+            if (selected == null) return;
+            try
+            {
+                contentBox.Text = manager.ReadLog(selected.Path);
+                contentBox.SelectionStart = 0;
+                contentBox.SelectionLength = 0;
+                statusLabel.Text = selected.Name + " · " + selected.Length + " 字节";
+            }
+            catch (Exception ex)
+            {
+                contentBox.Text = ex.ToString();
+                statusLabel.Text = "读取日志失败";
+            }
+        }
+    }
+
     [DataContract]
     public class VersionInfo
     {
@@ -1829,6 +2208,9 @@ namespace WindowLayoutLauncher
 
         [DataMember(Name = "published_at")]
         public string PublishedAt { get; set; }
+
+        [DataMember(Name = "sha256", EmitDefaultValue = false)]
+        public string Sha256 { get; set; }
     }
 
     public static class UpdateChecker
@@ -1839,9 +2221,10 @@ namespace WindowLayoutLauncher
             try
             {
                 var url = Program.VersionCheckUrl;
-                var request = System.Net.HttpWebRequest.Create(url);
+                var request = (System.Net.HttpWebRequest)System.Net.HttpWebRequest.Create(url);
                 request.Timeout = 8000;
                 request.Method = "GET";
+                request.UserAgent = Program.AppName + "/" + Program.Version;
                 request.Headers.Add("Cache-Control", "no-cache");
 
                 using (var response = request.GetResponse())
@@ -1862,6 +2245,11 @@ namespace WindowLayoutLauncher
                         if (info == null || string.IsNullOrWhiteSpace(info.Version))
                         {
                             error = "版本信息格式错误";
+                            return null;
+                        }
+                        if (string.IsNullOrWhiteSpace(info.DownloadUrl) || !IsTrustedDownloadUrl(info.DownloadUrl))
+                        {
+                            error = "更新地址不受信任或缺失";
                             return null;
                         }
                         return info;
@@ -1902,44 +2290,86 @@ namespace WindowLayoutLauncher
             var parts = cleaned.ToString().Split(new[] { '.' }, StringSplitOptions.RemoveEmptyEntries);
             if (parts.Length == 0) return null;
             var nums = new List<int>();
-            for (int i = 0; i < 4; i++)
+            try
             {
-                nums.Add(i < parts.Length ? int.Parse(parts[i]) : 0);
+                for (int i = 0; i < 4; i++)
+                {
+                    nums.Add(i < parts.Length ? int.Parse(parts[i]) : 0);
+                }
+            }
+            catch
+            {
+                return null;
             }
             return new Version(nums[0], nums[1], nums[2], nums[3]);
         }
 
         public static string DownloadUpdate(string url, string targetPath, Action<int> progressCallback)
         {
+            return DownloadUpdate(url, targetPath, progressCallback, null);
+        }
+
+        public static string DownloadUpdate(string url, string targetPath, Action<int> progressCallback, string expectedSha256)
+        {
+            string partialPath = targetPath + ".part";
             try
             {
-                using (var client = new System.Net.WebClient())
+                if (!IsTrustedDownloadUrl(url)) return "更新地址不受信任";
+                var uri = new Uri(url);
+                var request = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(uri);
+                request.Method = "GET";
+                request.Timeout = 20000;
+                request.ReadWriteTimeout = 20000;
+                request.UserAgent = Program.AppName + "/" + Program.Version;
+                request.AllowAutoRedirect = true;
+
+                if (File.Exists(partialPath)) File.Delete(partialPath);
+                if (File.Exists(targetPath)) File.Delete(targetPath);
+
+                using (var response = (System.Net.HttpWebResponse)request.GetResponse())
+                using (var input = response.GetResponseStream())
+                using (var output = new FileStream(partialPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
                 {
-                    var done = false;
-                    client.DownloadProgressChanged += (s, e) =>
+                    var buffer = new byte[64 * 1024];
+                    var total = response.ContentLength;
+                    long downloaded = 0;
+                    int lastPercent = -1;
+                    int read;
+                    while ((read = input.Read(buffer, 0, buffer.Length)) > 0)
                     {
-                        if (progressCallback != null) progressCallback(e.ProgressPercentage);
-                    };
-                    client.DownloadFileCompleted += (s, e) =>
-                    {
-                        done = true;
-                    };
-                    client.DownloadFileAsync(new Uri(url), targetPath);
-                    while (!done)
-                    {
-                        Application.DoEvents();
-                        Thread.Sleep(50);
+                        output.Write(buffer, 0, read);
+                        downloaded += read;
+                        var percent = total > 0 ? (int)Math.Min(99, downloaded * 100L / total) : 0;
+                        if (percent != lastPercent)
+                        {
+                            lastPercent = percent;
+                            if (progressCallback != null) progressCallback(percent);
+                        }
                     }
+                    output.Flush();
                 }
-                if (File.Exists(targetPath) && new FileInfo(targetPath).Length > 0)
-                {
-                    return null;
-                }
-                return "下载文件为空";
+
+                var validationError = ValidateDownloadedFile(partialPath, expectedSha256);
+                if (!string.IsNullOrEmpty(validationError)) return validationError;
+                File.Move(partialPath, targetPath);
+                if (progressCallback != null) progressCallback(100);
+                AppLogger.Write("INFO", "update_download_finished", targetPath);
+                return null;
             }
             catch (Exception ex)
             {
+                AppLogger.Write("ERROR", "update_download_failed", ex.Message);
                 return ex.Message;
+            }
+            finally
+            {
+                try
+                {
+                    if (File.Exists(partialPath)) File.Delete(partialPath);
+                }
+                catch
+                {
+                }
             }
         }
 
@@ -1947,20 +2377,43 @@ namespace WindowLayoutLauncher
         {
             try
             {
+                var validationError = ValidateDownloadedFile(newExePath, null);
+                if (!string.IsNullOrEmpty(validationError)) return false;
                 var currentExe = Application.ExecutablePath;
                 var dir = Path.GetDirectoryName(currentExe);
-                var batPath = Path.Combine(dir, "update.bat");
-                var oldExeBackup = Path.Combine(dir, "窗口布局启动器_old.exe");
+                var batPath = Path.Combine(Path.GetTempPath(), "WindowLayoutLauncher_Update_" + Guid.NewGuid().ToString("N") + ".cmd");
+                var backupDir = Path.Combine(dir, "backups");
+                Directory.CreateDirectory(backupDir);
+                var backupPath = Path.Combine(backupDir, "窗口布局启动器_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".exe");
+                var updateDir = Path.GetDirectoryName(newExePath);
 
                 var sb = new StringBuilder();
                 sb.AppendLine("@echo off");
-                sb.AppendLine("echo 正在更新窗口布局启动器...");
+                sb.AppendLine("setlocal EnableExtensions");
+                sb.AppendLine("set \"CURRENT=" + currentExe + "\"");
+                sb.AppendLine("set \"NEW=" + newExePath + "\"");
+                sb.AppendLine("set \"BACKUP=" + backupPath + "\"");
+                sb.AppendLine("set \"UPDATE_DIR=" + updateDir + "\"");
                 sb.AppendLine("timeout /t 2 /nobreak >nul");
-                sb.AppendLine("if exist \"" + oldExeBackup + "\" del \"" + oldExeBackup + "\"");
-                sb.AppendLine("ren \"" + currentExe + "\" \"" + Path.GetFileName(oldExeBackup) + "\"");
-                sb.AppendLine("move /Y \"" + newExePath + "\" \"" + currentExe + "\"");
-                sb.AppendLine("echo 更新完成，正在启动新版本...");
-                sb.AppendLine("start \"\" \"" + currentExe + "\"");
+                sb.AppendLine("if not exist \"%NEW%\" goto fail");
+                sb.AppendLine("if not exist \"%CURRENT%\" goto fail");
+                sb.AppendLine("copy /Y \"%CURRENT%\" \"%BACKUP%\" >nul");
+                sb.AppendLine("if errorlevel 1 goto fail");
+                sb.AppendLine("move /Y \"%NEW%\" \"%CURRENT%\" >nul");
+                sb.AppendLine("if errorlevel 1 goto rollback");
+                sb.AppendLine("start \"\" \"%CURRENT%\"");
+                sb.AppendLine("rmdir /s /q \"%UPDATE_DIR%\" >nul 2>nul");
+                sb.AppendLine("del \"%~f0\"");
+                sb.AppendLine("exit /b 0");
+                sb.AppendLine(":rollback");
+                sb.AppendLine("copy /Y \"%BACKUP%\" \"%CURRENT%\" >nul");
+                sb.AppendLine("start \"\" \"%CURRENT%\"");
+                sb.AppendLine("rmdir /s /q \"%UPDATE_DIR%\" >nul 2>nul");
+                sb.AppendLine("del \"%~f0\"");
+                sb.AppendLine("exit /b 1");
+                sb.AppendLine(":fail");
+                sb.AppendLine("start \"\" \"%CURRENT%\"");
+                sb.AppendLine("rmdir /s /q \"%UPDATE_DIR%\" >nul 2>nul");
                 sb.AppendLine("del \"%~f0\"");
                 File.WriteAllText(batPath, sb.ToString(), Encoding.Default);
 
@@ -1972,12 +2425,49 @@ namespace WindowLayoutLauncher
                     CreateNoWindow = true
                 });
 
+                AppLogger.Write("INFO", "update_apply_scheduled", "backup=" + backupPath);
                 return true;
             }
-            catch
+            catch (Exception ex)
             {
+                AppLogger.Write("ERROR", "update_apply_failed", ex.Message);
                 return false;
             }
+        }
+
+        private static bool IsTrustedDownloadUrl(string url)
+        {
+            Uri uri;
+            if (!Uri.TryCreate(url, UriKind.Absolute, out uri)) return false;
+            return string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(uri.Host, "github.com", StringComparison.OrdinalIgnoreCase) &&
+                uri.AbsolutePath.StartsWith("/zwmopen/WindowLayoutLauncher/releases/download/", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string ValidateDownloadedFile(string path, string expectedSha256)
+        {
+            if (string.IsNullOrWhiteSpace(path) || !File.Exists(path)) return "下载文件不存在";
+            var fileInfo = new FileInfo(path);
+            if (fileInfo.Length < 2) return "下载文件为空";
+
+            using (var stream = File.OpenRead(path))
+            {
+                if (stream.ReadByte() != 'M' || stream.ReadByte() != 'Z') return "下载文件不是有效的 Windows 程序";
+            }
+
+            if (!string.IsNullOrWhiteSpace(expectedSha256))
+            {
+                using (var sha = SHA256.Create())
+                using (var stream = File.OpenRead(path))
+                {
+                    var actual = BitConverter.ToString(sha.ComputeHash(stream)).Replace("-", "").ToLowerInvariant();
+                    if (!string.Equals(actual, expectedSha256.Trim().ToLowerInvariant(), StringComparison.OrdinalIgnoreCase))
+                    {
+                        return "更新文件校验失败";
+                    }
+                }
+            }
+            return null;
         }
     }
 
@@ -2098,47 +2588,55 @@ namespace WindowLayoutLauncher
             updateStatusLabel.ForeColor = UiTheme.Muted;
             Refresh();
 
-            string error;
-            var info = UpdateChecker.CheckForUpdate(out error);
-
-            if (info == null)
+            AppLogger.Write("INFO", "update_check_started", "manual");
+            ThreadPool.QueueUserWorkItem(_ =>
             {
-                updateStatusLabel.Text = "检查失败：" + (error ?? "未知错误");
-                updateStatusLabel.ForeColor = Color.FromArgb(220, 80, 80);
-                checkUpdateButton.Enabled = true;
-                return;
-            }
-
-            if (UpdateChecker.IsNewerVersion(info.Version, Program.Version))
-            {
-                updateStatusLabel.Text = "发现新版本 v" + info.Version;
-                updateStatusLabel.ForeColor = UiTheme.Blue;
-                var result = MessageBox.Show(this,
-                    "发现新版本 v" + info.Version + "\n\n" +
-                    (info.ReleaseNotes ?? "暂无更新说明") + "\n\n" +
-                    "是否立即更新？",
-                    "发现新版本",
-                    MessageBoxButtons.YesNo,
-                    MessageBoxIcon.Information);
-
-                if (result == DialogResult.Yes)
+                string error;
+                var info = UpdateChecker.CheckForUpdate(out error);
+                try
                 {
-                    DoUpdate(info);
+                    BeginInvoke((Action)(() =>
+                    {
+                        if (info == null)
+                        {
+                            updateStatusLabel.Text = "检查失败：" + (error ?? "未知错误");
+                            updateStatusLabel.ForeColor = Color.FromArgb(220, 80, 80);
+                        }
+                        else if (UpdateChecker.IsNewerVersion(info.Version, Program.Version))
+                        {
+                            updateStatusLabel.Text = "发现新版本 v" + info.Version;
+                            updateStatusLabel.ForeColor = UiTheme.Blue;
+                            var result = MessageBox.Show(this,
+                                "发现新版本 v" + info.Version + "\n\n" +
+                                (info.ReleaseNotes ?? "暂无更新说明") + "\n\n" +
+                                "是否立即更新？",
+                                "发现新版本",
+                                MessageBoxButtons.YesNo,
+                                MessageBoxIcon.Information);
+
+                            if (result == DialogResult.Yes) DoUpdate(info);
+                        }
+                        else
+                        {
+                            updateStatusLabel.Text = "当前已是最新版本";
+                            updateStatusLabel.ForeColor = Color.FromArgb(60, 160, 100);
+                        }
+                        checkUpdateButton.Enabled = true;
+                    }));
                 }
-            }
-            else
-            {
-                updateStatusLabel.Text = "当前已是最新版本";
-                updateStatusLabel.ForeColor = Color.FromArgb(60, 160, 100);
-            }
-            checkUpdateButton.Enabled = true;
+                catch
+                {
+                }
+                AppLogger.Write(info == null ? "WARN" : "INFO", "update_check_finished", info == null ? (error ?? "unknown") : "remote=" + info.Version);
+            });
         }
 
         private void DoUpdate(VersionInfo info)
         {
-            var tempDir = Path.Combine(Path.GetTempPath(), "WLL_Update");
+            var tempDir = Path.Combine(Path.GetTempPath(), "WindowLayoutLauncher_Update", Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(tempDir);
-            var newExe = Path.Combine(tempDir, "窗口布局启动器_new.exe");
+            var newExe = Path.Combine(tempDir, "窗口布局启动器.download.exe");
+            AppLogger.Write("INFO", "update_download_started", "version=" + info.Version);
 
             var progressForm = new Form();
             progressForm.Text = "正在下载更新";
@@ -2147,6 +2645,7 @@ namespace WindowLayoutLauncher
             progressForm.FormBorderStyle = FormBorderStyle.FixedDialog;
             progressForm.MaximizeBox = false;
             progressForm.MinimizeBox = false;
+            progressForm.ControlBox = false;
             progressForm.BackColor = UiTheme.WindowTop;
             progressForm.Font = new Font("Microsoft YaHei UI", 9F);
 
@@ -2169,24 +2668,37 @@ namespace WindowLayoutLauncher
 
             progressForm.Shown += (s, e) =>
             {
-                var error = UpdateChecker.DownloadUpdate(info.DownloadUrl, newExe, p =>
+                ThreadPool.QueueUserWorkItem(_ =>
                 {
+                    var error = UpdateChecker.DownloadUpdate(info.DownloadUrl, newExe, p =>
+                    {
+                        try
+                        {
+                            progressForm.BeginInvoke((Action)(() =>
+                            {
+                                progressBar.Value = Math.Max(0, Math.Min(100, p));
+                                progressLabel.Text = "正在下载... " + p + "%";
+                            }));
+                        }
+                        catch { }
+                    }, info.Sha256);
+
                     try
                     {
-                        progressBar.Value = Math.Max(0, Math.Min(100, p));
-                        progressLabel.Text = "正在下载... " + p + "%";
+                        progressForm.BeginInvoke((Action)(() =>
+                        {
+                            progressForm.DialogResult = string.IsNullOrEmpty(error) ? DialogResult.OK : DialogResult.Abort;
+                            progressForm.Close();
+                        }));
                     }
                     catch { }
                 });
-
-                progressForm.DialogResult = string.IsNullOrEmpty(error) ? DialogResult.OK : DialogResult.Abort;
-                progressForm.Close();
             };
 
             var result = progressForm.ShowDialog(this);
             if (result != DialogResult.OK)
             {
-                updateStatusLabel.Text = "下载失败";
+                updateStatusLabel.Text = "下载失败，详情已写入日志";
                 updateStatusLabel.ForeColor = Color.FromArgb(220, 80, 80);
                 return;
             }
@@ -2205,7 +2717,7 @@ namespace WindowLayoutLauncher
                 }
                 else
                 {
-                    MessageBox.Show(this, "更新失败，请手动下载替换。", "更新失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    MessageBox.Show(this, "更新失败，请查看日志后重试。", "更新失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 }
             }
         }

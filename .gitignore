@@ -10,6 +10,8 @@ release/layouts/*.json
 
 # 日志文件
 release/logs/*.log
+release/logs/*.jsonl
+release/backups/*
 
 # 更新检查记录
 last_update_check.txt

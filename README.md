@@ -6,7 +6,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/版本-2.0.0-blue.svg" alt="版本 2.0.0" />
+  <img src="https://img.shields.io/badge/版本-2.1.0-blue.svg" alt="版本 2.1.0" />
   <img src="https://img.shields.io/badge/平台-Windows%2010%20%2F%2011%20(64位)-brightgreen.svg" alt="平台" />
   <img src="https://img.shields.io/badge/核心技术-Win32%20API%20%2B%20Shell%20COM-orange.svg" alt="核心技术" />
   <img src="https://img.shields.io/badge/运行依赖-零外部依赖%20(系统内置)-blueviolet.svg" alt="运行依赖" />
@@ -76,6 +76,10 @@ graph LR
 * 打开启动器，在左侧卡片列表中选中目标布局，点击 **“打开布局”**；
 * 所有关联窗口将在不到一秒内全部自动复原、层级对齐并回到原位！
 
+### 3. 日志与诊断
+
+右侧点击 **“日志与诊断”**，可以在程序内读取最近的恢复日志、崩溃日志和更新日志；日志列表按最近修改时间排序，单个日志过大时会限制预览长度。日志文件保存在程序目录的 `logs/`，可通过查看器底部按钮直接打开。
+
 ---
 
 ## 📦 便携共享与跨机协同
@@ -88,6 +92,10 @@ graph LR
 ### 共享整个应用
 * 直接将包含可执行文件的文件夹整体打包发送即可；
 * 应用数据集中存放在 `layouts/` 目录，便于随身携带或同步至云盘。
+
+### 稳定版与开发版
+
+开发维护时使用桌面的 **“窗口布局启动器 - 开发版”**，日常工作使用 **“窗口布局启动器 - 稳定版”**。两套目录和布局数据物理隔离，验证通过后再将开发版提升为稳定版；更新失败时，稳定版会保留带时间戳的 `backups/` 备份。
 
 ---
 

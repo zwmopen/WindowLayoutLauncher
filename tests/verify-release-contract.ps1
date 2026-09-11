@@ -17,6 +17,16 @@ if (-not ($metadata.version -match '^\d+\.\d+\.\d+$')) {
     throw "version.json must contain a semantic version: $($metadata.version)"
 }
 
+$source = Get-Content -LiteralPath $sourcePath -Raw -Encoding UTF8
+if (-not $source.Contains('public const string Version = "' + $metadata.version + '"')) {
+    throw "source version must match version.json"
+}
+foreach ($requiredSourceText in @('class LogViewerForm', 'ThreadPool.QueueUserWorkItem', 'ValidateDownloadedFile', 'IsTrustedDownloadUrl')) {
+    if (-not $source.Contains($requiredSourceText)) {
+        throw "Source is missing upgrade contract: $requiredSourceText"
+    }
+}
+
 $expectedReleaseSegment = "/releases/download/v$($metadata.version)/"
 if (-not ([string]$metadata.download_url).Contains($expectedReleaseSegment)) {
     throw "download_url must point to the matching v$($metadata.version) release"
