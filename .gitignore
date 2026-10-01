@@ -18,3 +18,8 @@ last_update_check.txt
 
 # 导出文件
 release/exports/*.json
+
+# 发布二进制与构建压缩包（由 GitHub Releases 托管）
+release/*.exe
+release/*.zip
+
