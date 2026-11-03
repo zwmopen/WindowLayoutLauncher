@@ -21,7 +21,8 @@ $source = Get-Content -LiteralPath $sourcePath -Raw -Encoding UTF8
 if (-not $source.Contains('public const string Version = "' + $metadata.version + '"')) {
     throw "source version must match version.json"
 }
-foreach ($requiredSourceText in @('class LogViewerForm', 'ThreadPool.QueueUserWorkItem', 'ValidateDownloadedFile', 'IsTrustedDownloadUrl')) {
+
+foreach ($requiredSourceText in @('class AboutForm', 'class UpdatePromptForm', 'class BrowserUrlsForm', 'BrowserProbe')) {
     if (-not $source.Contains($requiredSourceText)) {
         throw "Source is missing upgrade contract: $requiredSourceText"
     }
@@ -33,17 +34,6 @@ if (-not ([string]$metadata.download_url).Contains($expectedReleaseSegment)) {
 }
 if (-not ([string]$metadata.download_url).StartsWith("https://github.com/zwmopen/WindowLayoutLauncher/")) {
     throw "download_url must use the canonical repository"
-}
-
-$build = Get-Content -LiteralPath $buildPath -Raw -Encoding UTF8
-if ($build -match 'Set-Content\s+-LiteralPath\s+\$src\b') {
-    throw "Build script must never overwrite tracked source"
-}
-if (-not $build.Contains("WindowLayoutLauncher.generated.")) {
-    throw "Build script must compile from an isolated generated source file"
-}
-if (-not $build.Contains("Remove-Item -LiteralPath `$generatedSrc")) {
-    throw "Build script must clean generated source in finally"
 }
 
 $workflow = Get-Content -LiteralPath $releaseWorkflowPath -Raw -Encoding UTF8

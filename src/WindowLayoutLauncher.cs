@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
@@ -8,34 +8,90 @@ using System.Drawing.Drawing2D;
 using System.Runtime.InteropServices;
 using System.Runtime.Serialization;
 using System.Runtime.Serialization.Json;
-using System.Security.Cryptography;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Windows.Forms;
+using System.Runtime.InteropServices.ComTypes;
 
 namespace WindowLayoutLauncher
 {
     static class Program
     {
-        public const string Version = "2.1.0";
+        public const string Version = "3.1.0";
         public const string AppName = "窗口布局启动器";
         public const string RepoUrl = "https://github.com/zwmopen/WindowLayoutLauncher";
         public const string VersionCheckUrl = "https://raw.githubusercontent.com/zwmopen/WindowLayoutLauncher/main/version.json";
+        public static readonly int ShowMainWindowMessage = Native.RegisterWindowMessage("WindowLayoutLauncher.ShowMainWindow.v3");
+        private static Mutex appMutex;
 
         [STAThread]
+        private static void WriteCliLog(string logDir, string line)
+        {
+            try
+            {
+                Directory.CreateDirectory(logDir);
+                File.AppendAllText(Path.Combine(logDir, "cli.log"),
+                    DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  " + line + Environment.NewLine, Encoding.UTF8);
+            }
+            catch
+            {
+            }
+        }
+
         static void Main(string[] args)
         {
-            AppLogger.Initialize(AppDomain.CurrentDomain.BaseDirectory);
             try
             {
                 TrySetDpiAwareness();
+                TaskbarIntegration.Initialize();
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
 
+                if (args.Length == 0)
+                {
+                    bool createdNew;
+                    appMutex = new Mutex(true, "Local\\WindowLayoutLauncher.v3", out createdNew);
+                    if (!createdNew)
+                    {
+                        ActivateExistingInstance();
+                        return;
+                    }
+                }
+
                 var manager = new LayoutManager(AppDomain.CurrentDomain.BaseDirectory);
+                var logDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "logs");
+                if (args.Length >= 1 && string.Equals(args[0], "--probe", StringComparison.OrdinalIgnoreCase))
+                {
+                    Directory.CreateDirectory(logDir);
+                    var probeFile = Path.Combine(logDir, "browser_probe_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".json");
+                    File.WriteAllText(probeFile, BrowserProbe.BuildReport(), Encoding.UTF8);
+                    return;
+                }
+                if (args.Length >= 2 && string.Equals(args[0], "--save", StringComparison.OrdinalIgnoreCase))
+                {
+                    var saved = manager.SaveCurrent(args[1]);
+                    var browsers = 0;
+                    if (saved != null)
+                    {
+                        foreach (var item in saved.Items)
+                        {
+                            if (item.Kind == "browser" || item.Kind == "web") browsers++;
+                        }
+                    }
+                    WriteCliLog(logDir, "save \"" + args[1] + "\" items=" + (saved != null ? saved.Items.Count : 0) + " browsers=" + browsers + "  " + BrowserProbe.LastTiming);
+                    return;
+                }
                 if (args.Length >= 2 && string.Equals(args[0], "--restore", StringComparison.OrdinalIgnoreCase))
                 {
-                    manager.Restore(args[1]);
+                    var restoreResult = manager.Restore(args[1]);
+                    var details = restoreResult.FailDetails == null ? "" : (" | " + string.Join(" ; ", restoreResult.FailDetails.ToArray()));
+                    WriteCliLog(logDir, "restore \"" + args[1] + "\" ok=" + restoreResult.Ok + " failed=" + restoreResult.Failed + details);
+                    var quiet = args.Length >= 3 && string.Equals(args[2], "--quiet", StringComparison.OrdinalIgnoreCase);
+                    if (restoreResult.Failed > 0 && !quiet)
+                    {
+                        Application.Run(NotificationToastForm.ForRestoreResult(restoreResult));
+                    }
                     return;
                 }
 
@@ -46,8 +102,32 @@ namespace WindowLayoutLauncher
                 WriteCrashLog(ex);
                 if (args.Length == 0)
                 {
-                    MessageBox.Show("窗口布局启动器遇到错误，已写入 logs 目录。", "窗口布局启动器", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    MessageBox.Show("窗口布局启动器遇到错误，已写入 crash.log。", "窗口布局启动器", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 }
+            }
+        }
+
+        private static void ActivateExistingInstance()
+        {
+            for (int attempt = 0; attempt < 20; attempt++)
+            {
+                IntPtr found = IntPtr.Zero;
+                Native.EnumWindows((hWnd, lParam) =>
+                {
+                    int length = Native.GetWindowTextLength(hWnd);
+                    if (length <= 0) return true;
+                    var title = new StringBuilder(length + 1);
+                    Native.GetWindowText(hWnd, title, title.Capacity);
+                    if (!string.Equals(title.ToString(), AppName, StringComparison.Ordinal)) return true;
+                    found = hWnd;
+                    return false;
+                }, IntPtr.Zero);
+                if (found != IntPtr.Zero)
+                {
+                    Native.PostMessage(found, ShowMainWindowMessage, IntPtr.Zero, IntPtr.Zero);
+                    return;
+                }
+                Thread.Sleep(100);
             }
         }
 
@@ -55,9 +135,7 @@ namespace WindowLayoutLauncher
         {
             try
             {
-                var logDir = AppLogger.LogsDirectory;
-                Directory.CreateDirectory(logDir);
-                var path = Path.Combine(logDir, "crash_" + DateTime.Now.ToString("yyyyMMdd_HHmmss_fff") + ".log");
+                var path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "crash.log");
                 var lines = new List<string>();
                 lines.Add(DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
                 lines.Add(ex == null ? "null exception" : ex.GetType().FullName);
@@ -71,7 +149,6 @@ namespace WindowLayoutLauncher
                     lines.Add(ex.InnerException.StackTrace);
                 }
                 File.WriteAllLines(path, lines.ToArray(), Encoding.UTF8);
-                AppLogger.Write("ERROR", "crash", ex == null ? "null exception" : ex.ToString());
             }
             catch
             {
@@ -99,85 +176,51 @@ namespace WindowLayoutLauncher
         }
     }
 
-    public static class AppLogger
-    {
-        private static readonly object Sync = new object();
-        private static string baseDir = AppDomain.CurrentDomain.BaseDirectory;
-
-        public static string LogsDirectory
-        {
-            get { return Path.Combine(baseDir, "logs"); }
-        }
-
-        public static void Initialize(string root)
-        {
-            if (!string.IsNullOrWhiteSpace(root))
-            {
-                baseDir = Path.GetFullPath(root);
-            }
-
-            try
-            {
-                Directory.CreateDirectory(LogsDirectory);
-            }
-            catch
-            {
-            }
-        }
-
-        public static void Write(string level, string eventName, string message)
-        {
-            try
-            {
-                var line = "{\"timestamp\":\"" + Escape(DateTime.Now.ToString("o")) +
-                    "\",\"level\":\"" + Escape(level) +
-                    "\",\"event\":\"" + Escape(eventName) +
-                    "\",\"message\":\"" + Escape(message) + "\"}";
-                lock (Sync)
-                {
-                    Directory.CreateDirectory(LogsDirectory);
-                    var path = Path.Combine(LogsDirectory, "app_" + DateTime.Now.ToString("yyyyMMdd") + ".jsonl");
-                    File.AppendAllText(path, line + Environment.NewLine, new UTF8Encoding(false));
-                }
-            }
-            catch
-            {
-            }
-        }
-
-        private static string Escape(string value)
-        {
-            if (value == null) return "";
-            var builder = new StringBuilder(value.Length + 16);
-            foreach (var ch in value)
-            {
-                switch (ch)
-                {
-                    case '\\': builder.Append("\\\\"); break;
-                    case '"': builder.Append("\\\""); break;
-                    case '\r': builder.Append("\\r"); break;
-                    case '\n': builder.Append("\\n"); break;
-                    case '\t': builder.Append("\\t"); break;
-                    default:
-                        if (ch < 32) builder.Append(' '); else builder.Append(ch);
-                        break;
-                }
-            }
-            return builder.ToString();
-        }
-    }
-
     [DataContract]
     public class LayoutConfig
     {
+        [DataMember(Name = "format_version", EmitDefaultValue = false)]
+        public int FormatVersion { get; set; }
+
         [DataMember(Name = "name")]
         public string Name { get; set; }
+
+        [DataMember(Name = "task_mode", EmitDefaultValue = false)]
+        public string TaskMode { get; set; }
 
         [DataMember(Name = "saved_at")]
         public string SavedAt { get; set; }
 
         [DataMember(Name = "items")]
         public List<LayoutItem> Items { get; set; }
+
+        [DataMember(Name = "screens", EmitDefaultValue = false)]
+        public List<SavedScreen> Screens { get; set; }
+    }
+
+    [DataContract]
+    public class SavedScreen
+    {
+        [DataMember(Name = "device")]
+        public string Device { get; set; }
+
+        [DataMember(Name = "index")]
+        public int Index { get; set; }
+
+        [DataMember(Name = "x")]
+        public int X { get; set; }
+
+        [DataMember(Name = "y")]
+        public int Y { get; set; }
+
+        [DataMember(Name = "w")]
+        public int W { get; set; }
+
+        [DataMember(Name = "h")]
+        public int H { get; set; }
+
+        [DataMember(Name = "primary")]
+        public bool Primary { get; set; }
     }
 
     [DataContract]
@@ -204,8 +247,41 @@ namespace WindowLayoutLauncher
         [DataMember(Name = "url", EmitDefaultValue = false)]
         public string Url { get; set; }
 
+        [DataMember(Name = "urls", EmitDefaultValue = false)]
+        public List<string> Urls { get; set; }
+
+        [DataMember(Name = "profile", EmitDefaultValue = false)]
+        public string Profile { get; set; }
+
+        [DataMember(Name = "profile_name", EmitDefaultValue = false)]
+        public string ProfileName { get; set; }
+
+        [DataMember(Name = "user_data_dir", EmitDefaultValue = false)]
+        public string UserDataDir { get; set; }
+
+        [DataMember(Name = "launch_args", EmitDefaultValue = false)]
+        public string LaunchArgs { get; set; }
+
         [DataMember(Name = "title_keyword", EmitDefaultValue = false)]
         public string TitleKeyword { get; set; }
+
+        /// <summary>该窗口保存的全部网页，兼容只有 url 字段的旧布局。</summary>
+        public List<string> UrlList
+        {
+            get
+            {
+                var list = new List<string>();
+                if (Urls != null)
+                {
+                    foreach (var u in Urls)
+                    {
+                        if (!string.IsNullOrWhiteSpace(u) && !list.Contains(u)) list.Add(u.Trim());
+                    }
+                }
+                if (list.Count == 0 && !string.IsNullOrWhiteSpace(Url)) list.Add(Url.Trim());
+                return list;
+            }
+        }
 
         [DataMember(Name = "x")]
         public int X { get; set; }
@@ -218,6 +294,24 @@ namespace WindowLayoutLauncher
 
         [DataMember(Name = "h")]
         public int H { get; set; }
+
+        [DataMember(Name = "screen_device", EmitDefaultValue = false)]
+        public string ScreenDevice { get; set; }
+
+        [DataMember(Name = "screen_index", EmitDefaultValue = false)]
+        public int ScreenIndex { get; set; }
+
+        [DataMember(Name = "relative_x", EmitDefaultValue = false)]
+        public double RelativeX { get; set; }
+
+        [DataMember(Name = "relative_y", EmitDefaultValue = false)]
+        public double RelativeY { get; set; }
+
+        [DataMember(Name = "relative_w", EmitDefaultValue = false)]
+        public double RelativeW { get; set; }
+
+        [DataMember(Name = "relative_h", EmitDefaultValue = false)]
+        public double RelativeH { get; set; }
     }
 
     public class LayoutSummary
@@ -226,26 +320,27 @@ namespace WindowLayoutLauncher
         public string Path { get; set; }
         public string SavedAt { get; set; }
         public int Count { get; set; }
+        public string TaskMode { get; set; }
+        public List<LayoutItem> Items { get; set; }
+        public List<SavedScreen> Screens { get; set; }
         public string Display
         {
             get { return Name + "    " + Count + " 个窗口"; }
         }
     }
 
-    public class LogSummary
+    public class HealthIssue
     {
-        public string Name { get; set; }
-        public string Path { get; set; }
-        public DateTime ModifiedAt { get; set; }
-        public long Length { get; set; }
+        public string Level { get; set; }
+        public string Message { get; set; }
+    }
 
-        public string Display
+    public class HealthReport
+    {
+        public List<HealthIssue> Issues { get; set; }
+        public bool HasBlockingIssues
         {
-            get
-            {
-                var size = Length < 1024 ? Length + " B" : (Length / 1024.0).ToString("0.0") + " KB";
-                return Name + "    " + ModifiedAt.ToString("MM-dd HH:mm") + "    " + size;
-            }
+            get { return Issues != null && Issues.Any(x => string.Equals(x.Level, "error", StringComparison.OrdinalIgnoreCase)); }
         }
     }
 
@@ -277,19 +372,13 @@ namespace WindowLayoutLauncher
     {
         private readonly string baseDir;
         private readonly string layoutDir;
-        private readonly string logDir;
 
         public string LayoutDir { get { return layoutDir; } }
-        public string LogsDir { get { return logDir; } }
-
         public LayoutManager(string baseDir)
         {
-            this.baseDir = System.IO.Path.GetFullPath(baseDir);
+            this.baseDir = baseDir;
             layoutDir = System.IO.Path.Combine(baseDir, "layouts");
-            logDir = System.IO.Path.Combine(this.baseDir, "logs");
-            AppLogger.Initialize(this.baseDir);
             Directory.CreateDirectory(layoutDir);
-            Directory.CreateDirectory(logDir);
         }
 
         public List<LayoutSummary> GetLayouts()
@@ -306,88 +395,31 @@ namespace WindowLayoutLauncher
                         Name = string.IsNullOrWhiteSpace(layout.Name) ? System.IO.Path.GetFileNameWithoutExtension(file) : layout.Name,
                         Path = file,
                         SavedAt = layout.SavedAt,
-                        Count = layout.Items == null ? 0 : layout.Items.Count
+                        Count = layout.Items == null ? 0 : layout.Items.Count,
+                        TaskMode = string.IsNullOrWhiteSpace(layout.TaskMode) ? InferTaskMode(layout.Name) : layout.TaskMode,
+                        Items = layout.Items ?? new List<LayoutItem>(),
+                        Screens = layout.Screens ?? new List<SavedScreen>()
                     });
                 }
-                catch (Exception ex)
+                catch
                 {
-                    AppLogger.Write("WARN", "layout_read_failed", file + " | " + ex.Message);
                 }
             }
             return result;
         }
 
-        public List<LogSummary> GetLogs()
-        {
-            Directory.CreateDirectory(logDir);
-            var result = new List<LogSummary>();
-            var files = Directory.GetFiles(logDir, "*.log")
-                .Concat(Directory.GetFiles(logDir, "*.jsonl"))
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .Select(path => new FileInfo(path))
-                .OrderByDescending(file => file.LastWriteTimeUtc)
-                .ThenByDescending(file => file.Name, StringComparer.OrdinalIgnoreCase)
-                .Take(100);
-
-            foreach (var file in files)
-            {
-                result.Add(new LogSummary
-                {
-                    Name = file.Name,
-                    Path = file.FullName,
-                    ModifiedAt = file.LastWriteTime,
-                    Length = file.Length
-                });
-            }
-            return result;
-        }
-
-        public string ReadLog(string path)
-        {
-            if (string.IsNullOrWhiteSpace(path)) throw new InvalidOperationException("没有选择日志文件。");
-
-            var fullPath = System.IO.Path.GetFullPath(path);
-            var root = logDir.TrimEnd(System.IO.Path.DirectorySeparatorChar, System.IO.Path.AltDirectorySeparatorChar) + System.IO.Path.DirectorySeparatorChar;
-            if (!fullPath.StartsWith(root, StringComparison.OrdinalIgnoreCase))
-            {
-                throw new InvalidOperationException("只能读取应用日志目录中的文件。");
-            }
-            if (!File.Exists(fullPath)) throw new FileNotFoundException("日志文件不存在。", fullPath);
-
-            const int maxChars = 600000;
-            using (var reader = new StreamReader(fullPath, Encoding.UTF8, true))
-            {
-                var buffer = new char[8192];
-                var builder = new StringBuilder();
-                int read;
-                while ((read = reader.Read(buffer, 0, buffer.Length)) > 0)
-                {
-                    if (builder.Length + read > maxChars)
-                    {
-                        builder.Append(buffer, 0, maxChars - builder.Length);
-                        builder.AppendLine();
-                        builder.Append("[日志过长，仅显示前 ");
-                        builder.Append(maxChars);
-                        builder.Append(" 个字符]");
-                        break;
-                    }
-                    builder.Append(buffer, 0, read);
-                }
-                return builder.ToString();
-            }
-        }
-
-        public LayoutConfig SaveCurrent(string name)
+        public LayoutConfig SaveCurrent(string name, string taskMode = null)
         {
             var safeName = SafeName(name);
             var topWindows = WindowTools.GetTopLevelWindows();
             var items = new List<LayoutItem>();
+            var screens = WindowTools.GetSavedScreens();
             var captured = new HashSet<IntPtr>();
             var currentExe = FullPathTrim(Application.ExecutablePath);
 
             foreach (var explorer in WindowTools.GetExplorerWindows(topWindows, false).OrderBy(w => w.X).ThenBy(w => w.Y))
             {
-                items.Add(new LayoutItem
+                var item = new LayoutItem
                 {
                     Kind = "explorer",
                     Path = explorer.Path,
@@ -395,28 +427,69 @@ namespace WindowLayoutLauncher
                     Y = explorer.Y,
                     W = explorer.W,
                     H = explorer.H
-                });
+                };
+                WindowTools.AttachScreenPosition(item, screens);
+                items.Add(item);
                 captured.Add(explorer.Hwnd);
             }
 
-            foreach (var browser in topWindows
-                .Where(w => (EqualsIgnoreCase(w.ProcessName, "msedge") || EqualsIgnoreCase(w.ProcessName, "chrome")) &&
-                            ContainsIgnoreCase(w.Title, "ChatGPT") &&
-                            !w.IsMinimized)
-                .OrderBy(w => w.X).ThenBy(w => w.Y))
+            var swTotal = Stopwatch.StartNew();
+            var sw = Stopwatch.StartNew();
+
+            var visibleWindows = topWindows.Where(w => !w.IsMinimized).ToList();
+            var browserWindows = BrowserProbe.FilterBrowserWindows(visibleWindows, 6000)
+                .OrderBy(w => w.X).ThenBy(w => w.Y)
+                .ToList();
+            var tProbe = sw.ElapsedMilliseconds; sw.Restart();
+
+            var browserUrls = BrowserProbe.ReadActiveUrls(browserWindows.Select(w => w.Hwnd).ToList(), 2500);
+            var tUrls = sw.ElapsedMilliseconds; sw.Restart();
+
+            var browserTabUrls = BrowserProbe.ReadAllTabUrlsForWindows(browserWindows.Select(w => w.Hwnd).ToList(), 10, 5000);
+            var tTabs = sw.ElapsedMilliseconds; sw.Restart();
+
+            foreach (var browser in browserWindows)
             {
-                items.Add(new LayoutItem
+                var probe = BrowserProbe.Probe(browser.ProcessId, browser.ExePath, browser.Title, browser.Hwnd);
+                if (probe == null)
+                {
+                    probe = new BrowserLaunchInfo { Family = "other", Profile = "", ProfileName = "" };
+                }
+
+                string onlyUrl;
+                if (!browserUrls.TryGetValue(browser.Hwnd, out onlyUrl)) onlyUrl = null;
+
+                var urls = new List<string>();
+
+                // 多标签窗口尽量把整窗口的标签页都记下来；读不到就只记当前这一页
+                List<string> tabUrls = null;
+                if (browserTabUrls.TryGetValue(browser.Hwnd, out tabUrls) && tabUrls != null && tabUrls.Count > 0)
+                {
+                    urls.AddRange(tabUrls);
+                }
+                if (urls.Count == 0 && !string.IsNullOrWhiteSpace(onlyUrl)) urls.Add(onlyUrl.Trim());
+
+                var item = new LayoutItem
                 {
                     Kind = "browser",
-                    Browser = EqualsIgnoreCase(browser.ProcessName, "msedge") ? "edge" : "chrome",
-                    ExePath = WindowTools.GetProcessPath(browser.ProcessId),
-                    Url = "https://chatgpt.com/",
-                    TitleKeyword = "ChatGPT",
+                    Browser = string.IsNullOrWhiteSpace(probe.Family) ? "other" : probe.Family,
+                    ProcessName = browser.ProcessName,
+                    Profile = probe.Profile,
+                    ProfileName = probe.ProfileName,
+                    UserDataDir = probe.UserDataDir,
+                    LaunchArgs = probe.Family == "bit" ? BrowserProbe.ArgsOnly(probe.CommandLine, probe.ExePath) : null,
+                    ExePath = string.IsNullOrWhiteSpace(probe.ExePath) ? WindowTools.GetProcessPath(browser.ProcessId) : probe.ExePath,
+                    Url = urls.Count > 0 ? urls[0] : null,
+                    Urls = urls,
+                    Title = browser.Title,
+                    TitleKeyword = TitleKeywordFromTitle(BrowserProbe.KeywordFromTitle(browser.Title)),
                     X = browser.X,
                     Y = browser.Y,
                     W = browser.W,
                     H = browser.H
-                });
+                };
+                WindowTools.AttachScreenPosition(item, screens);
+                items.Add(item);
                 captured.Add(browser.Hwnd);
             }
 
@@ -427,7 +500,7 @@ namespace WindowLayoutLauncher
                 var exePath = WindowTools.GetProcessPath(app.ProcessId);
                 if (IsIgnoredAppWindow(app, exePath, currentExe)) continue;
 
-                items.Add(new LayoutItem
+                var item = new LayoutItem
                 {
                     Kind = "app",
                     ProcessName = app.ProcessName,
@@ -438,15 +511,23 @@ namespace WindowLayoutLauncher
                     Y = app.Y,
                     W = app.W,
                     H = app.H
-                });
+                };
+                WindowTools.AttachScreenPosition(item, screens);
+                items.Add(item);
             }
 
             var layout = new LayoutConfig
             {
+                FormatVersion = 3,
                 Name = safeName,
+                TaskMode = string.IsNullOrWhiteSpace(taskMode) ? InferTaskMode(safeName) : taskMode,
                 SavedAt = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
-                Items = items
+                Items = items,
+                Screens = screens
             };
+
+            var tItems = sw.ElapsedMilliseconds;
+            BrowserProbe.LastTiming = "total=" + swTotal.ElapsedMilliseconds + "ms probe=" + tProbe + " urls=" + tUrls + " tabs=" + tTabs + " items=" + tItems;
 
             WriteLayout(GetLayoutPath(safeName), layout);
             return layout;
@@ -457,27 +538,10 @@ namespace WindowLayoutLauncher
             var path = File.Exists(nameOrPath) ? nameOrPath : GetLayoutPath(SafeName(nameOrPath));
             if (!File.Exists(path))
             {
-                AppLogger.Write("WARN", "restore_missing_layout", path);
                 return new RestoreResult { Ok = 0, Failed = 1, Message = "没有找到这个布局", FailDetails = new List<string> { "布局文件不存在: " + path } };
             }
 
-            LayoutConfig layout;
-            try
-            {
-                layout = ReadLayout(path);
-            }
-            catch (Exception ex)
-            {
-                AppLogger.Write("ERROR", "restore_layout_read_failed", path + " | " + ex.Message);
-                return new RestoreResult
-                {
-                    Ok = 0,
-                    Failed = 1,
-                    Message = "布局读取失败",
-                    FailDetails = new List<string> { path + " → " + ex.Message }
-                };
-            }
-
+            var layout = ReadLayout(path);
             var topWindows = WindowTools.GetTopLevelWindows();
             var explorerWindows = WindowTools.GetExplorerWindows(topWindows, true);
             var used = new HashSet<IntPtr>();
@@ -486,9 +550,8 @@ namespace WindowLayoutLauncher
             var failDetails = new List<string>();
             var logLines = new List<string>();
             logLines.Add("===== 恢复布局: " + (layout.Name ?? Path.GetFileNameWithoutExtension(path)) + " =====");
-            logLines.Add("时间: " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff"));
+            logLines.Add("时间: " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
             logLines.Add("");
-            AppLogger.Write("INFO", "restore_started", (layout.Name ?? Path.GetFileNameWithoutExtension(path)) + " | items=" + (layout.Items == null ? 0 : layout.Items.Count));
 
             int idx = 0;
             foreach (var item in layout.Items ?? new List<LayoutItem>())
@@ -526,11 +589,12 @@ namespace WindowLayoutLauncher
                     continue;
                 }
 
-                if (WindowTools.MoveWindow(hwnd, item.X, item.Y, item.W, item.H))
+                var target = WindowTools.GetTargetBounds(item, layout.Screens);
+                if (WindowTools.MoveWindow(hwnd, target.X, target.Y, target.Width, target.Height))
                 {
                     ok++;
                     used.Add(hwnd);
-                    logLines.Add("    ✓ 已移动到 (" + item.X + "," + item.Y + ") " + item.W + "x" + item.H);
+                    logLines.Add("    ✓ 已移动到 (" + target.X + "," + target.Y + ") " + target.Width + "x" + target.Height);
                 }
                 else
                 {
@@ -556,14 +620,10 @@ namespace WindowLayoutLauncher
             {
                 var logDir = Path.Combine(baseDir, "logs");
                 Directory.CreateDirectory(logDir);
-                var logPath = Path.Combine(logDir, "restore_" + DateTime.Now.ToString("yyyyMMdd_HHmmss_fff") + ".log");
+                var logPath = Path.Combine(logDir, "restore_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".log");
                 File.WriteAllLines(logPath, logLines.ToArray(), Encoding.UTF8);
-                AppLogger.Write("INFO", "restore_finished", (layout.Name ?? Path.GetFileNameWithoutExtension(path)) + " | ok=" + ok + " | failed=" + failed + " | log=" + logPath);
             }
-            catch (Exception ex)
-            {
-                AppLogger.Write("ERROR", "restore_log_write_failed", ex.Message);
-            }
+            catch { }
 
             return new RestoreResult
             {
@@ -597,6 +657,68 @@ namespace WindowLayoutLauncher
             if (File.Exists(summary.Path)) File.Delete(summary.Path);
         }
 
+        public LayoutConfig GetLayout(LayoutSummary summary)
+        {
+            if (summary == null || string.IsNullOrWhiteSpace(summary.Path) || !File.Exists(summary.Path)) return null;
+            return ReadLayout(summary.Path);
+        }
+
+        public HealthReport CheckHealth(LayoutSummary summary)
+        {
+            var report = new HealthReport { Issues = new List<HealthIssue>() };
+            var layout = GetLayout(summary);
+            if (layout == null)
+            {
+                report.Issues.Add(new HealthIssue { Level = "error", Message = "布局文件不存在或无法读取。" });
+                return report;
+            }
+
+            var openWindows = WindowTools.GetTopLevelWindows();
+            foreach (var item in layout.Items ?? new List<LayoutItem>())
+            {
+                if (EqualsIgnoreCase(item.Kind, "explorer") && !string.IsNullOrWhiteSpace(item.Path) && !Directory.Exists(item.Path))
+                {
+                    report.Issues.Add(new HealthIssue { Level = "error", Message = "文件夹不存在：" + item.Path });
+                }
+                else if (EqualsIgnoreCase(item.Kind, "app") && !string.IsNullOrWhiteSpace(item.ExePath) && !File.Exists(item.ExePath))
+                {
+                    var isOpen = openWindows.Any(w => EqualsIgnoreCase(w.ProcessName, item.ProcessName));
+                    if (!isOpen)
+                    {
+                        report.Issues.Add(new HealthIssue { Level = "warning", Message = "软件路径失效：" + (item.Title ?? item.ProcessName ?? item.ExePath) });
+                    }
+                }
+                else if (EqualsIgnoreCase(item.Kind, "browser"))
+                {
+                    if (string.IsNullOrWhiteSpace(item.Profile))
+                    {
+                        // 旧布局没有配置信息，按原来方式打开即可，不弹确认框打扰
+                        report.Issues.Add(new HealthIssue
+                        {
+                            Level = "info",
+                            Message = "旧布局未记录浏览器配置，会按当前默认配置打开：" + (item.Title ?? item.ProfileName ?? "")
+                        });
+                    }
+                    else if (EqualsIgnoreCase(item.Browser, "bit") && BitBrowserApi.ListEnvironments().Count == 0)
+                    {
+                        report.Issues.Add(new HealthIssue
+                        {
+                            Level = "warning",
+                            Message = "比特浏览器客户端没有运行，环境「" + (item.ProfileName ?? item.Profile) + "」可能打不开。"
+                        });
+                    }
+                }
+            }
+
+            var savedCount = layout.Screens == null ? 0 : layout.Screens.Count;
+            var currentCount = Screen.AllScreens.Length;
+            if (savedCount > 0 && savedCount != currentCount)
+            {
+                report.Issues.Add(new HealthIssue { Level = "warning", Message = "保存时有 " + savedCount + " 台显示器，当前有 " + currentCount + " 台；窗口会自动适配。" });
+            }
+            return report;
+        }
+
         public LayoutConfig RenameLayout(LayoutSummary summary, string newName)
         {
             if (summary == null || string.IsNullOrWhiteSpace(summary.Path) || !File.Exists(summary.Path))
@@ -620,6 +742,14 @@ namespace WindowLayoutLauncher
                 File.Delete(oldPath);
             }
             return layout;
+        }
+
+        public void SaveLayout(string name, LayoutConfig layout)
+        {
+            if (layout == null) throw new InvalidOperationException("布局内容为空。");
+            var safeName = SafeName(string.IsNullOrWhiteSpace(name) ? layout.Name : name);
+            layout.Name = safeName;
+            WriteLayout(GetLayoutPath(safeName), layout);
         }
 
         public string ExportLayoutJson(LayoutSummary summary)
@@ -726,32 +856,100 @@ namespace WindowLayoutLauncher
         private IntPtr FindOrOpenBrowser(LayoutItem item, List<WindowInfo> existing, HashSet<IntPtr> used, out string failReason)
         {
             failReason = null;
-            var processName = EqualsIgnoreCase(item.Browser, "edge") ? "msedge" :
-                              EqualsIgnoreCase(item.Browser, "chrome") ? "chrome" : item.Browser;
-            var keyword = string.IsNullOrWhiteSpace(item.TitleKeyword) ? "ChatGPT" : item.TitleKeyword;
+            var family = string.IsNullOrWhiteSpace(item.Browser) ? "other" : item.Browser;
+            var processName = ResolveBrowserProcessName(family, item.ProcessName);
+            if (string.IsNullOrWhiteSpace(item.ProcessName) && !string.IsNullOrWhiteSpace(item.ExePath))
+            {
+                processName = System.IO.Path.GetFileNameWithoutExtension(item.ExePath);
+            }
+            var urls = item.UrlList;
+            var profile = (item.Profile ?? "").Trim();
+            var keyword = string.IsNullOrWhiteSpace(item.TitleKeyword) ? (item.Title ?? "") : item.TitleKeyword;
+            var label = BrowserProbe.FamilyLabel(family) + (string.IsNullOrWhiteSpace(item.ProfileName) ? (string.IsNullOrWhiteSpace(profile) ? "" : " / " + profile) : " / " + item.ProfileName);
 
-            var found = existing
-                .Where(w => EqualsIgnoreCase(w.ProcessName, processName) && !used.Contains(w.Hwnd))
-                .Where(w => string.IsNullOrWhiteSpace(keyword) || ContainsIgnoreCase(w.Title, keyword))
+            // 1) 先复用“同一个用户配置”已经打开的窗口，避免开重
+            var candidates = existing
+                .Where(w => !used.Contains(w.Hwnd) && IsSameBrowserFamily(w, family, processName))
                 .OrderBy(w => w.IsMinimized ? 1 : 0)
                 .ThenBy(w => w.X).ThenBy(w => w.Y)
-                .FirstOrDefault();
-            if (found != null) return found.Hwnd;
+                .ToList();
 
-            var before = new HashSet<IntPtr>(existing.Where(w => EqualsIgnoreCase(w.ProcessName, processName)).Select(w => w.Hwnd));
-            var exe = item.ExePath;
-            if (string.IsNullOrWhiteSpace(exe) || !File.Exists(exe))
+            WindowInfo found = null;
+            var itemDir = (item.UserDataDir ?? "").Trim().TrimEnd('\\', '/');
+            var expectCustomDir = !string.IsNullOrWhiteSpace(itemDir) && !BrowserProbe.IsStandardUserDataDir(itemDir, family);
+            var profileName = (item.ProfileName ?? "").Trim();
+
+            // 先按“配置显示名”复用（Chrome 运行时最可靠的判据）
+            if (!string.IsNullOrWhiteSpace(profileName))
             {
-                exe = EqualsIgnoreCase(processName, "msedge") ? "msedge.exe" : "chrome.exe";
+                foreach (var candidate in candidates)
+                {
+                    var info = BrowserProbe.Probe(candidate.ProcessId, candidate.ExePath, candidate.Title, candidate.Hwnd);
+                    if (info == null) continue;
+                    if (!string.IsNullOrWhiteSpace(info.ProfileName) && BrowserProbe.NamesCompatible(info.ProfileName, profileName))
+                    {
+                        if (expectCustomDir)
+                        {
+                            var candidateDir = (info.UserDataDir ?? "").Trim().TrimEnd('\\', '/');
+                            if (!string.Equals(candidateDir, itemDir, StringComparison.OrdinalIgnoreCase)) continue;
+                        }
+                        found = candidate;
+                        break;
+                    }
+                }
             }
-            var url = string.IsNullOrWhiteSpace(item.Url) ? "https://chatgpt.com/" : item.Url;
-            try
+
+            // 再按配置目录匹配（浏览器冷启动时命令行带 --profile-directory 的场景）
+            if (found == null && !string.IsNullOrWhiteSpace(profile))
             {
-                Process.Start(exe, "--new-window " + Quote(url));
+                foreach (var candidate in candidates)
+                {
+                    var info = BrowserProbe.Probe(candidate.ProcessId, candidate.ExePath, candidate.Title, candidate.Hwnd);
+                    if (info == null) continue;
+                    if (!string.Equals((info.Profile ?? "").Trim(), profile, StringComparison.OrdinalIgnoreCase)) continue;
+                    if (expectCustomDir)
+                    {
+                        var candidateDir = (info.UserDataDir ?? "").Trim().TrimEnd('\\', '/');
+                        if (!string.Equals(candidateDir, itemDir, StringComparison.OrdinalIgnoreCase)) continue;
+                    }
+                    found = candidate;
+                    break;
+                }
             }
-            catch (Exception ex)
+
+            if (found == null && candidates.Count > 0)
             {
-                failReason = "启动浏览器失败: " + ex.Message;
+                var domain = GetDomain(urls.Count > 0 ? urls[0] : item.Url);
+                found = candidates.FirstOrDefault(w =>
+                {
+                    // 已经识别出别的配置的窗口不能抢，否则多开时会张冠李戴
+                    if (!string.IsNullOrWhiteSpace(profile) || !string.IsNullOrWhiteSpace(profileName))
+                    {
+                        var info = BrowserProbe.Probe(w.ProcessId, w.ExePath, w.Title, w.Hwnd);
+                        if (info != null && (!string.IsNullOrWhiteSpace(info.Profile) || !string.IsNullOrWhiteSpace(info.ProfileName))) return false;
+                    }
+                    return (!string.IsNullOrWhiteSpace(keyword) && ContainsIgnoreCase(w.Title, keyword)) ||
+                           (!string.IsNullOrWhiteSpace(domain) && ContainsIgnoreCase(w.Title, domain));
+                });
+            }
+
+            if (found != null)
+            {
+                var openedUrl = BrowserProbe.ReadActiveUrl(found.Hwnd);
+                var pending = urls
+                    .Where(u => !string.Equals(u, openedUrl, StringComparison.OrdinalIgnoreCase))
+                    .ToList();
+                if (pending.Count > 0) OpenBrowserTabs(family, item, found.Hwnd, pending);
+                return found.Hwnd;
+            }
+
+            // 2) 打开新窗口
+            var before = new HashSet<IntPtr>(existing
+                .Where(w => IsSameBrowserFamily(w, family, processName))
+                .Select(w => w.Hwnd));
+
+            if (!LaunchBrowserWindow(family, item, urls, out failReason))
+            {
                 return IntPtr.Zero;
             }
 
@@ -759,23 +957,196 @@ namespace WindowLayoutLauncher
             {
                 var latest = WindowTools.GetTopLevelWindows();
                 var fresh = latest
-                    .Where(w => EqualsIgnoreCase(w.ProcessName, processName) && !before.Contains(w.Hwnd))
+                    .Where(w => !before.Contains(w.Hwnd) && !used.Contains(w.Hwnd) && IsSameBrowserFamily(w, family, processName))
                     .OrderBy(w => w.X).ThenBy(w => w.Y)
                     .FirstOrDefault();
                 if (fresh != null) return fresh;
                 return latest
-                    .Where(w => EqualsIgnoreCase(w.ProcessName, processName) && !used.Contains(w.Hwnd))
+                    .Where(w => !used.Contains(w.Hwnd) && IsSameBrowserFamily(w, family, processName))
                     .Where(w => string.IsNullOrWhiteSpace(keyword) || ContainsIgnoreCase(w.Title, keyword))
                     .OrderBy(w => w.X).ThenBy(w => w.Y)
                     .FirstOrDefault();
-            }, 6000);
+            }, 10000);
 
             if (created == null)
             {
-                failReason = "等待浏览器窗口超时 (exe=" + exe + ")";
+                failReason = "等待浏览器窗口超时（" + label + "）";
                 return IntPtr.Zero;
             }
+
+            // 比特浏览器环境打开后只带一个空白/上次页面，其余网址用地址栏补上
+            if (string.Equals(family, "bit", StringComparison.OrdinalIgnoreCase) && urls.Count > 0)
+            {
+                Thread.Sleep(600);
+                foreach (var url in urls)
+                {
+                    Native.NavigateInWindow(created.Hwnd, url);
+                }
+            }
             return created.Hwnd;
+        }
+
+        private static string ResolveBrowserProcessName(string family, string fallback)
+        {
+            if (EqualsIgnoreCase(family, "edge")) return "msedge";
+            if (EqualsIgnoreCase(family, "chrome")) return "chrome";
+            return string.IsNullOrWhiteSpace(fallback) ? (family ?? "") : fallback;
+        }
+
+        private static bool IsSameBrowserFamily(WindowInfo window, string family, string processName)
+        {
+            if (window == null) return false;
+            if (EqualsIgnoreCase(family, "bit"))
+            {
+                var info = BrowserProbe.Probe(window.ProcessId, window.ExePath, window.Title, window.Hwnd);
+                return info != null && EqualsIgnoreCase(info.Family, "bit");
+            }
+            return EqualsIgnoreCase(window.ProcessName, processName);
+        }
+
+        private static string ResolveBrowserExe(string family, string processName)
+        {
+            if (EqualsIgnoreCase(family, "edge")) return "msedge.exe";
+            if (EqualsIgnoreCase(family, "chrome")) return "chrome.exe";
+            if (!string.IsNullOrWhiteSpace(processName) && !processName.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+            {
+                return processName + ".exe";
+            }
+            return processName;
+        }
+
+        /// <summary>组装“用哪个用户配置打开”的命令行参数：多开浏览器靠 user-data-dir 区分实例。</summary>
+        private static string BrowserProfileArgs(LayoutItem item, string family)
+        {
+            var builder = new StringBuilder();
+            var userDataDir = item.UserDataDir;
+            if (!string.IsNullOrWhiteSpace(userDataDir) && !BrowserProbe.IsStandardUserDataDir(userDataDir, family))
+            {
+                builder.Append("--user-data-dir=").Append(Quote(userDataDir)).Append(' ');
+            }
+            var profile = (item.Profile ?? "").Trim();
+            // 旧布局或界面树识别只留下配置名时，按名反查配置目录，否则会打开到默认配置上
+            if (string.IsNullOrWhiteSpace(profile) && !string.IsNullOrWhiteSpace(item.ProfileName))
+            {
+                profile = ChromeProfiles.FindDirectory(family, item.ProfileName, "").Trim();
+            }
+            if (!string.IsNullOrWhiteSpace(profile))
+            {
+                builder.Append("--profile-directory=").Append(Quote(profile)).Append(' ');
+            }
+            return builder.ToString();
+        }
+
+        private bool LaunchBrowserWindow(string family, LayoutItem item, List<string> urls, out string failReason)
+        {
+            failReason = null;
+            var profile = (item.Profile ?? "").Trim();
+            var exe = item.ExePath;
+            if (string.IsNullOrWhiteSpace(exe) || !File.Exists(exe))
+            {
+                exe = ResolveBrowserExe(family, item.ProcessName);
+            }
+
+            if (EqualsIgnoreCase(family, "bit"))
+            {
+                string apiError = null;
+                if (!string.IsNullOrWhiteSpace(profile) && BitBrowserApi.OpenEnvironment(profile, out apiError))
+                {
+                    return true;
+                }
+
+                if (!string.IsNullOrWhiteSpace(item.LaunchArgs) && !string.IsNullOrWhiteSpace(exe) && File.Exists(exe))
+                {
+                    try
+                    {
+                        Process.Start(exe, item.LaunchArgs);
+                        return true;
+                    }
+                    catch (Exception ex)
+                    {
+                        failReason = "比特浏览器环境启动失败: " + ex.Message;
+                        return false;
+                    }
+                }
+
+                failReason = "比特浏览器没有运行，无法打开环境「" +
+                             (string.IsNullOrWhiteSpace(item.ProfileName) ? (profile.Length > 0 ? profile : "未知") : item.ProfileName) +
+                             "」" + (string.IsNullOrWhiteSpace(apiError) ? "" : "（" + apiError + "）");
+                return false;
+            }
+
+            if (string.IsNullOrWhiteSpace(exe))
+            {
+                failReason = "找不到浏览器程序";
+                return false;
+            }
+
+            var firstUrl = urls.Count > 0 ? urls[0] : null;
+            var profileArgs = BrowserProfileArgs(item, family);
+            var args = new StringBuilder();
+            args.Append(profileArgs);
+            args.Append("--new-window");
+            if (!string.IsNullOrWhiteSpace(firstUrl))
+            {
+                args.Append(' ').Append(Quote(firstUrl));
+            }
+
+            try
+            {
+                Process.Start(exe, args.ToString());
+            }
+            catch (Exception ex)
+            {
+                failReason = "启动浏览器失败: " + ex.Message;
+                return false;
+            }
+
+            if (urls.Count > 1)
+            {
+                Thread.Sleep(800);
+                for (int i = 1; i < urls.Count; i++)
+                {
+                    try
+                    {
+                        var tabArgs = profileArgs + Quote(urls[i]);
+                        Process.Start(exe, tabArgs);
+                    }
+                    catch
+                    {
+                    }
+                    Thread.Sleep(250);
+                }
+            }
+            return true;
+        }
+
+        private static void OpenBrowserTabs(string family, LayoutItem item, IntPtr hwnd, List<string> urls)
+        {
+            if (EqualsIgnoreCase(family, "bit"))
+            {
+                foreach (var url in urls) Native.NavigateInWindow(hwnd, url);
+                return;
+            }
+
+            var exe = item.ExePath;
+            if (string.IsNullOrWhiteSpace(exe) || !File.Exists(exe))
+            {
+                exe = ResolveBrowserExe(family, item.ProcessName);
+            }
+            if (string.IsNullOrWhiteSpace(exe)) return;
+
+            var profileArgs = BrowserProfileArgs(item, family);
+            foreach (var url in urls)
+            {
+                try
+                {
+                    Process.Start(exe, profileArgs + Quote(url));
+                }
+                catch
+                {
+                }
+                Thread.Sleep(300);
+            }
         }
 
         private IntPtr FindOrOpenApp(LayoutItem item, List<WindowInfo> existing, HashSet<IntPtr> used, out string failReason)
@@ -967,6 +1338,16 @@ namespace WindowLayoutLauncher
             return "\"" + (value ?? "").Replace("\"", "\\\"") + "\"";
         }
 
+        private static string GetDomain(string url)
+        {
+            try
+            {
+                Uri uri;
+                return Uri.TryCreate(url, UriKind.Absolute, out uri) ? uri.Host.Replace("www.", "") : "";
+            }
+            catch { return ""; }
+        }
+
         private static string FullPathTrim(string path)
         {
             try { return System.IO.Path.GetFullPath(path).TrimEnd('\\'); }
@@ -993,7 +1374,9 @@ namespace WindowLayoutLauncher
                 "ApplicationFrameHost",
                 "SystemSettings",
                 "RuntimeBroker",
-                "LockApp"
+                "LockApp",
+                "SpeedBall",
+                "msedgewebview2"
             };
 
             if (ignoredProcesses.Contains(processName)) return true;
@@ -1020,6 +1403,18 @@ namespace WindowLayoutLauncher
             }
             value = value.Trim(' ', '.');
             return string.IsNullOrWhiteSpace(value) ? "未命名布局" : value;
+        }
+
+        public static string InferTaskMode(string name)
+        {
+            var value = name ?? "";
+            if (ContainsIgnoreCase(value, "素材")) return "素材处理";
+            if (ContainsIgnoreCase(value, "小红书") || ContainsIgnoreCase(value, "写作") || ContainsIgnoreCase(value, "文案")) return "写小红书";
+            if (ContainsIgnoreCase(value, "剪辑") || ContainsIgnoreCase(value, "视频")) return "剪辑";
+            if (ContainsIgnoreCase(value, "团建") || ContainsIgnoreCase(value, "方案")) return "做团建方案";
+            if (ContainsIgnoreCase(value, "客服")) return "客服工作";
+            if (ContainsIgnoreCase(value, "运营")) return "运营";
+            return "工作";
         }
 
         private static bool EqualsIgnoreCase(string a, string b)
@@ -1175,6 +1570,67 @@ namespace WindowLayoutLauncher
             return result;
         }
 
+        public static List<SavedScreen> GetSavedScreens()
+        {
+            var result = new List<SavedScreen>();
+            var screens = Screen.AllScreens;
+            for (int i = 0; i < screens.Length; i++)
+            {
+                var area = screens[i].WorkingArea;
+                result.Add(new SavedScreen
+                {
+                    Device = screens[i].DeviceName,
+                    Index = i,
+                    X = area.X,
+                    Y = area.Y,
+                    W = area.Width,
+                    H = area.Height,
+                    Primary = screens[i].Primary
+                });
+            }
+            return result;
+        }
+
+        public static void AttachScreenPosition(LayoutItem item, List<SavedScreen> screens)
+        {
+            if (item == null || screens == null || screens.Count == 0) return;
+            var center = new Point(item.X + Math.Max(1, item.W) / 2, item.Y + Math.Max(1, item.H) / 2);
+            var screen = screens.FirstOrDefault(s => new Rectangle(s.X, s.Y, s.W, s.H).Contains(center)) ?? screens.FirstOrDefault(s => s.Primary) ?? screens[0];
+            item.ScreenDevice = screen.Device;
+            item.ScreenIndex = screen.Index;
+            item.RelativeX = screen.W <= 0 ? 0 : (item.X - screen.X) / (double)screen.W;
+            item.RelativeY = screen.H <= 0 ? 0 : (item.Y - screen.Y) / (double)screen.H;
+            item.RelativeW = screen.W <= 0 ? 0 : item.W / (double)screen.W;
+            item.RelativeH = screen.H <= 0 ? 0 : item.H / (double)screen.H;
+        }
+
+        public static Rectangle GetTargetBounds(LayoutItem item, List<SavedScreen> savedScreens)
+        {
+            var fallback = new Rectangle(item.X, item.Y, Math.Max(240, item.W), Math.Max(160, item.H));
+            var current = Screen.AllScreens;
+            if (current == null || current.Length == 0) return fallback;
+
+            Screen target = current.FirstOrDefault(s => string.Equals(s.DeviceName, item.ScreenDevice, StringComparison.OrdinalIgnoreCase));
+            if (target == null && item.ScreenIndex >= 0 && item.ScreenIndex < current.Length) target = current[item.ScreenIndex];
+            if (target == null) target = Screen.PrimaryScreen ?? current[0];
+            var area = target.WorkingArea;
+
+            bool hasRelative = item.RelativeW > 0.05 && item.RelativeH > 0.05;
+            var rect = hasRelative
+                ? new Rectangle(
+                    area.X + (int)Math.Round(item.RelativeX * area.Width),
+                    area.Y + (int)Math.Round(item.RelativeY * area.Height),
+                    (int)Math.Round(item.RelativeW * area.Width),
+                    (int)Math.Round(item.RelativeH * area.Height))
+                : fallback;
+
+            rect.Width = Math.Max(240, Math.Min(rect.Width, area.Width));
+            rect.Height = Math.Max(160, Math.Min(rect.Height, area.Height));
+            rect.X = Math.Max(area.Left, Math.Min(rect.X, area.Right - rect.Width));
+            rect.Y = Math.Max(area.Top, Math.Min(rect.Y, area.Bottom - rect.Height));
+            return rect;
+        }
+
         public static bool MoveWindow(IntPtr hwnd, int x, int y, int width, int height)
         {
             if (hwnd == IntPtr.Zero || width <= 0 || height <= 0) return false;
@@ -1182,6 +1638,1451 @@ namespace WindowLayoutLauncher
             Native.ShowWindowAsync(hwnd, 9);
             if (wasMinimized) Thread.Sleep(60);
             return Native.MoveWindow(hwnd, x, y, width, height, true);
+        }
+    }
+
+    public class BrowserLaunchInfo
+    {
+        public string Family { get; set; }
+        public string Profile { get; set; }
+        public string ProfileName { get; set; }
+        public string UserDataDir { get; set; }
+        public string ExePath { get; set; }
+        public string CommandLine { get; set; }
+    }
+
+    /// <summary>识别浏览器窗口属于哪个用户配置，并读取当前标签页地址。</summary>
+    public static class BrowserProbe
+    {
+        private static readonly object Sync = new object();
+        // 同一个浏览器进程里可以同时存在多个不同配置的窗口（Chrome 就是这样），
+        // 所以缓存必须按窗口句柄做键，按进程 ID 缓存会把第一个窗口的配置名套到所有窗口上。
+        private static readonly Dictionary<IntPtr, BrowserLaunchInfo> Cache = new Dictionary<IntPtr, BrowserLaunchInfo>();
+        private static DateTime cacheStamp = DateTime.MinValue;
+
+        private static readonly HashSet<string> ChromiumProcessNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "chrome", "msedge", "brave", "vivaldi", "chromium", "opera", "yandex",
+            "360chrome", "360ChromeX", "360se", "360se6", "qqbrowser", "sogouexplorer",
+            "ucbrowser", "liebao", "maxthon", "2345explorer", "centbrowser", "qiyu", "twinkstar"
+        };
+
+        private static readonly Dictionary<string, bool> ChromiumDirCache = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+
+        public static string FamilyLabel(string family)
+        {
+            if (EqualsIgnoreCase(family, "chrome")) return "Chrome";
+            if (EqualsIgnoreCase(family, "edge")) return "Edge";
+            if (EqualsIgnoreCase(family, "bit")) return "比特浏览器";
+            if (EqualsIgnoreCase(family, "chromium")) return "其他 Chromium 浏览器";
+            if (string.IsNullOrWhiteSpace(family)) return "浏览器";
+            return family;
+        }
+
+        /// <summary>Chromium 内核浏览器都可以用这套方式识别配置，不限于 Chrome / Edge。</summary>
+        private static bool LooksLikeChromium(string exePath)
+        {
+            if (string.IsNullOrWhiteSpace(exePath)) return false;
+            try
+            {
+                var dir = System.IO.Path.GetDirectoryName(exePath);
+                if (string.IsNullOrWhiteSpace(dir) || !Directory.Exists(dir)) return false;
+
+                lock (Sync)
+                {
+                    bool hit;
+                    if (ChromiumDirCache.TryGetValue(dir, out hit)) return hit;
+                }
+
+                var result = File.Exists(System.IO.Path.Combine(dir, "chrome_100_percent.pak"))
+                             || File.Exists(System.IO.Path.Combine(dir, "chrome.dll"))
+                             || (File.Exists(System.IO.Path.Combine(dir, "icudtl.dat")) && File.Exists(System.IO.Path.Combine(dir, "chrome_elf.dll")));
+
+                lock (Sync) { ChromiumDirCache[dir] = result; }
+                return result;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// <summary>是否是浏览器自带的默认用户目录（不是多开用的独立目录）。</summary>
+        public static bool IsStandardUserDataDir(string userDataDir, string family)
+        {
+            if (string.IsNullOrWhiteSpace(userDataDir)) return true;
+            var local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            var chromeDefault = System.IO.Path.Combine(local, "Google", "Chrome", "User Data");
+            var edgeDefault = System.IO.Path.Combine(local, "Microsoft", "Edge", "User Data");
+            var value = userDataDir.TrimEnd('\\', '/');
+            if (value.Equals(chromeDefault, StringComparison.OrdinalIgnoreCase)) return true;
+            if (value.Equals(edgeDefault, StringComparison.OrdinalIgnoreCase)) return true;
+            return false;
+        }
+
+        private static bool EqualsIgnoreCase(string a, string b)
+        {
+            return string.Equals(a ?? "", b ?? "", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool ContainsIgnoreCase(string text, string value)
+        {
+            if (string.IsNullOrEmpty(value)) return false;
+            return (text ?? "").IndexOf(value, StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        /// <summary>窗口标题里的配置名常写成 “Hichem (二次申诉xxx)”，配置目录里存的却是短名，这里取括号内的主体。</summary>
+        public static string ProfileCore(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value)) return (value ?? "").Trim();
+            var text = value.Trim();
+            var match = Regex.Match(text, "\\((.+)\\)\\s*$");
+            return match.Success ? match.Groups[1].Value.Trim() : text;
+        }
+
+        /// <summary>两个配置名是否指向同一个配置：允许 “人名 (配置名)” 与 “配置名” 互认。</summary>
+        public static bool NamesCompatible(string a, string b)
+        {
+            if (string.IsNullOrWhiteSpace(a) || string.IsNullOrWhiteSpace(b)) return false;
+            if (EqualsIgnoreCase(a, b)) return true;
+
+            var coreA = ProfileCore(a);
+            var coreB = ProfileCore(b);
+            if (coreA.Length > 0 && EqualsIgnoreCase(coreA, b)) return true;
+            if (coreB.Length > 0 && EqualsIgnoreCase(a, coreB)) return true;
+            if (coreA.Length > 0 && EqualsIgnoreCase(coreA, coreB)) return true;
+
+            var shorter = a.Length <= b.Length ? a : b;
+            var longer = a.Length <= b.Length ? b : a;
+            if (shorter.Length >= 6 && longer.IndexOf(shorter, StringComparison.OrdinalIgnoreCase) >= 0) return true;
+            return false;
+        }
+
+        public static BrowserLaunchInfo Probe(int processId, string exeHint, string title, IntPtr hwnd)
+        {
+            lock (Sync)
+            {
+                if (DateTime.UtcNow - cacheStamp > TimeSpan.FromSeconds(3))
+                {
+                    Cache.Clear();
+                    cacheStamp = DateTime.UtcNow;
+                }
+                BrowserLaunchInfo cached;
+                if (hwnd != IntPtr.Zero && Cache.TryGetValue(hwnd, out cached)) return cached;
+            }
+
+            var info = ProbeCore(processId, exeHint, title, hwnd);
+            lock (Sync)
+            {
+                if (hwnd != IntPtr.Zero) Cache[hwnd] = info;
+            }
+            return info;
+        }
+
+        // WMI 查询很慢，而同一个浏览器进程的几十个窗口命令行完全一样，按进程缓存即可
+        private static readonly Dictionary<int, KeyValuePair<string, string>> CommandLineCache =
+            new Dictionary<int, KeyValuePair<string, string>>();
+        private static DateTime commandLineStamp = DateTime.MinValue;
+
+        /// <summary>一次浅层遍历同时取到的窗口信息：配置名、地址栏网址。</summary>
+        public class WindowInspect
+        {
+            public string Url = "";
+            public bool Omnibox;
+            public string ProfileName = "";
+            public string RootName = "";
+        }
+
+        // 界面树遍历不便宜，同一个窗口短期内复用一次遍历的结果
+        private static readonly Dictionary<IntPtr, WindowInspect> InspectCache = new Dictionary<IntPtr, WindowInspect>();
+        private static DateTime inspectStamp = DateTime.MinValue;
+
+        public static WindowInspect Inspect(IntPtr hwnd)
+        {
+            if (hwnd == IntPtr.Zero) return new WindowInspect();
+
+            lock (Sync)
+            {
+                if (DateTime.UtcNow - inspectStamp < TimeSpan.FromSeconds(30))
+                {
+                    WindowInspect hit;
+                    if (InspectCache.TryGetValue(hwnd, out hit)) return hit;
+                }
+                else
+                {
+                    InspectCache.Clear();
+                }
+            }
+
+            var result = new WindowInspect();
+            try
+            {
+                var root = System.Windows.Automation.AutomationElement.FromHandle(hwnd);
+                if (root != null)
+                {
+                    result.RootName = root.Current.Name ?? "";
+
+                    var elements = new List<System.Windows.Automation.AutomationElement>();
+                    CollectElements(root, elements, 0, 6, 150);
+
+                    foreach (var element in elements)
+                    {
+                        string name;
+                        try { name = element.Current.Name ?? ""; }
+                        catch { continue; }
+                        if (name.Length == 0 || !string.IsNullOrEmpty(result.ProfileName)) continue;
+                        var match = Regex.Match(name, "^(.*?)\\s+-\\s+(Google Chrome|Microsoft Edge|Chromium|360[^\\s]*)\\s+-\\s+(.+)$");
+                        if (match.Success) result.ProfileName = match.Groups[3].Value.Trim();
+                    }
+
+                    foreach (var element in elements)
+                    {
+                        string id;
+                        try { id = element.Current.AutomationId ?? ""; }
+                        catch { continue; }
+                        if (!IsOmniboxId(id)) continue;
+                        var value = TryGetValue(element);
+                        if (string.IsNullOrWhiteSpace(value)) continue;
+                        result.Omnibox = true;
+                        result.Url = value.Trim();
+                        break;
+                    }
+
+                    if (string.IsNullOrWhiteSpace(result.Url))
+                    {
+                        foreach (var element in elements)
+                        {
+                            string name;
+                            try { name = element.Current.Name ?? ""; }
+                            catch { continue; }
+                            if (!IsOmniboxName(name)) continue;
+                            var value = TryGetValue(element);
+                            if (string.IsNullOrWhiteSpace(value)) continue;
+                            result.Omnibox = true;
+                            result.Url = value.Trim();
+                            break;
+                        }
+                    }
+                }
+            }
+            catch
+            {
+            }
+
+            lock (Sync)
+            {
+                inspectStamp = DateTime.UtcNow;
+                InspectCache[hwnd] = result;
+            }
+            return result;
+        }
+
+        private static string GetCommandLineCached(int processId, out string exePath)
+        {
+            exePath = null;
+            lock (Sync)
+            {
+                if (DateTime.UtcNow - commandLineStamp > TimeSpan.FromSeconds(60)) CommandLineCache.Clear();
+                KeyValuePair<string, string> hit;
+                if (CommandLineCache.TryGetValue(processId, out hit))
+                {
+                    exePath = hit.Value;
+                    return hit.Key;
+                }
+            }
+
+            string exe;
+            var commandLine = ProcessQuery.GetCommandLine(processId, out exe);
+            lock (Sync)
+            {
+                commandLineStamp = DateTime.UtcNow;
+                CommandLineCache[processId] = new KeyValuePair<string, string>(commandLine, exe);
+            }
+            exePath = exe;
+            return commandLine;
+        }
+
+        private static BrowserLaunchInfo ProbeCore(int processId, string exeHint, string title, IntPtr hwnd)
+        {
+            string exeFromWmi;
+            var commandLine = GetCommandLineCached(processId, out exeFromWmi);
+            var exe = !string.IsNullOrWhiteSpace(exeFromWmi) ? exeFromWmi : (exeHint ?? "");
+
+            string processName = "";
+            try { processName = Process.GetProcessById(processId).ProcessName; }
+            catch { }
+
+            var family = DetectFamily(processName, exe, commandLine);
+            if (family == null) return null;
+
+            // 界面树里的配置名最可靠：Chrome 运行时会忽略 --profile-directory，一个进程里还能同时跑多个配置
+            // 一次遍历同时取配置名和地址栏，分开各查一遍会让保存慢一倍
+            var inspect = (hwnd != IntPtr.Zero) ? Inspect(hwnd) : null;
+            string rootName = inspect != null ? inspect.RootName : null;
+            var treeProfile = inspect != null ? inspect.ProfileName : null;
+
+            // Chromium 系必须能读到地址栏、或从界面树认出配置名，
+            // 否则它多半不是浏览器主窗口（翻译气泡、下载气泡、对话框等）
+            if (EqualsIgnoreCase(family, "chrome") || EqualsIgnoreCase(family, "edge") || EqualsIgnoreCase(family, "chromium"))
+            {
+                if (hwnd == IntPtr.Zero) return null;
+                var url = inspect != null ? inspect.Url : null;
+                if (string.IsNullOrWhiteSpace(treeProfile) && string.IsNullOrWhiteSpace(url)) return null;
+            }
+
+            var profileDir = ExtractArgument(commandLine, "--profile-directory");
+            var userDataDir = ExtractArgument(commandLine, "--user-data-dir");
+
+            var info = new BrowserLaunchInfo
+            {
+                Family = family,
+                ExePath = exe,
+                CommandLine = commandLine,
+                UserDataDir = userDataDir
+            };
+
+            if (EqualsIgnoreCase(family, "bit"))
+            {
+                var envId = BitBrowserApi.ResolveEnvironmentId(title, userDataDir);
+                if (!string.IsNullOrWhiteSpace(envId))
+                {
+                    info.Profile = envId;
+                    info.ProfileName = BitBrowserApi.NameOf(envId, title);
+                }
+                else if (!string.IsNullOrWhiteSpace(userDataDir))
+                {
+                    info.Profile = System.IO.Path.GetFileName(userDataDir.TrimEnd('\\', '/'));
+                    info.ProfileName = info.Profile;
+                }
+                else
+                {
+                    // 比特浏览器客户端自己的界面窗口也带 bitbrowser 路径，不能当成环境窗口
+                    return null;
+                }
+            }
+            else
+            {
+                // 界面树里的配置名最可靠（Chrome 运行时会忽略 --profile-directory）
+                var standardDir = IsStandardUserDataDir(userDataDir, family);
+
+                if (!string.IsNullOrWhiteSpace(treeProfile))
+                {
+                    info.ProfileName = treeProfile;
+                    info.Profile = ChromeProfiles.FindDirectory(family, treeProfile, profileDir);
+                }
+                else if (!standardDir)
+                {
+                    var folder = System.IO.Path.GetFileName((userDataDir ?? "").TrimEnd('\\', '/'));
+                    var suffix = string.IsNullOrWhiteSpace(profileDir) || EqualsIgnoreCase(profileDir, "Default") ? "" : " / " + profileDir;
+                    var name = string.IsNullOrWhiteSpace(folder) || EqualsIgnoreCase(folder, "User Data")
+                        ? (profileDir ?? "Default")
+                        : folder;
+                    info.ProfileName = name + suffix;
+                    info.Profile = string.IsNullOrWhiteSpace(profileDir) ? "Default" : profileDir;
+                }
+                else
+                {
+                    info.Profile = string.IsNullOrWhiteSpace(profileDir) ? "Default" : profileDir;
+                    info.ProfileName = ChromeProfiles.GetDisplayName(family, info.Profile);
+                }
+            }
+
+            // 进程名兜底：偶尔拿不到 exe 路径时，用进程名还原浏览器类型
+            if (string.IsNullOrWhiteSpace(info.ExePath))
+            {
+                info.ExePath = "";
+            }
+            return info;
+        }
+
+        private static string DetectFamily(string processName, string exe, string commandLine)
+        {
+            if (EqualsIgnoreCase(processName, "msedgewebview2")) return null;
+            if (ContainsIgnoreCase(exe, "bitbrowser") || ContainsIgnoreCase(commandLine, "bitbrowser")) return "bit";
+            if (EqualsIgnoreCase(processName, "msedge") || ContainsIgnoreCase(exe, "msedge.exe")) return "edge";
+            if (EqualsIgnoreCase(processName, "chrome") || ContainsIgnoreCase(exe, "chrome.exe")) return "chrome";
+            if (ChromiumProcessNames.Contains(processName ?? "")) return "chromium";
+            if (LooksLikeChromium(exe)) return "chromium";
+            return null;
+        }
+
+        public static bool IsBrowserWindow(WindowInfo window)
+        {
+            if (window == null || string.IsNullOrWhiteSpace(window.Title)) return false;
+            return Probe(window.ProcessId, window.ExePath, window.Title, window.Hwnd) != null;
+        }
+
+        /// <summary>并行判断哪些窗口是浏览器：单个窗口的界面树查询要一秒上下，串行会让保存卡住。</summary>
+        public static List<WindowInfo> FilterBrowserWindows(List<WindowInfo> windows, int totalTimeoutMs)
+        {
+            var results = new Dictionary<IntPtr, bool>();
+            if (windows == null || windows.Count == 0) return new List<WindowInfo>();
+
+            var gate = new object();
+            var threads = new List<Thread>();
+            foreach (var window in windows)
+            {
+                var captured = window;
+                var thread = new Thread(() =>
+                {
+                    var ok = false;
+                    try { ok = IsBrowserWindow(captured); }
+                    catch { }
+                    lock (gate) { results[captured.Hwnd] = ok; }
+                });
+                thread.IsBackground = true;
+                thread.SetApartmentState(ApartmentState.STA);
+                thread.Start();
+                threads.Add(thread);
+            }
+
+            var deadline = DateTime.UtcNow.AddMilliseconds(totalTimeoutMs);
+            foreach (var thread in threads)
+            {
+                var left = (int)(deadline - DateTime.UtcNow).TotalMilliseconds;
+                if (left > 0) thread.Join(left);
+            }
+
+            lock (gate)
+            {
+                var picked = new List<WindowInfo>();
+                foreach (var window in windows)
+                {
+                    bool ok;
+                    if (results.TryGetValue(window.Hwnd, out ok) && ok) picked.Add(window);
+                }
+                return picked;
+            }
+        }
+
+        /// <summary>从完整命令行里去掉可执行文件本身，只留参数（用于按原样重启）。</summary>
+        public static string ArgsOnly(string commandLine, string exePath)
+        {
+            if (string.IsNullOrWhiteSpace(commandLine)) return null;
+            var text = commandLine.Trim();
+            if (text.StartsWith("\"", StringComparison.Ordinal))
+            {
+                var end = text.IndexOf('"', 1);
+                if (end > 0) return text.Substring(end + 1).Trim();
+                return null;
+            }
+            if (!string.IsNullOrWhiteSpace(exePath) && text.StartsWith(exePath, StringComparison.OrdinalIgnoreCase))
+            {
+                return text.Substring(exePath.Length).Trim();
+            }
+            var space = text.IndexOf(' ');
+            if (space > 0)
+            {
+                var first = text.Substring(0, space);
+                if (first.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) return text.Substring(space + 1).Trim();
+            }
+            return null;
+        }
+
+        public static string ExtractArgument(string commandLine, string name)
+        {
+            if (string.IsNullOrWhiteSpace(commandLine)) return null;
+            // 配置目录里可能带空格（如 Profile 32），未加引号时必须取到下一个 --参数 之前
+            var pattern = Regex.Escape(name) + "=(?:\"([^\"]*)\"|(.*?))(?=\\s+--|\\s*$)";
+            var match = Regex.Match(commandLine, pattern, RegexOptions.IgnoreCase);
+            if (!match.Success) return null;
+            var value = match.Groups[1].Success ? match.Groups[1].Value : match.Groups[2].Value;
+            return string.IsNullOrWhiteSpace(value) ? null : value.Trim();
+        }
+
+    public class UrlRead
+    {
+        public string Url { get; set; }
+        public bool Omnibox { get; set; }
+        public int EditCount { get; set; }
+        public int Ms { get; set; }
+        public string Error { get; set; }
+    }
+
+        /// <summary>读取窗口当前标签页地址；读不到返回 null（不阻塞主流程）。</summary>
+        public static string ReadActiveUrl(IntPtr hwnd)
+        {
+            if (hwnd == IntPtr.Zero) return null;
+            string result = null;
+            var thread = new Thread(() =>
+            {
+                try { result = ReadActiveUrlCore(hwnd).Url; }
+                catch { }
+            });
+            thread.IsBackground = true;
+            thread.SetApartmentState(ApartmentState.STA);
+            thread.Start();
+            if (!thread.Join(2500)) return null;
+            return NormalizeUrl(result);
+        }
+
+        /// <summary>带诊断信息的读取，用于排查“为什么读不到网址”。</summary>
+        public static UrlRead ReadActiveUrlWithDiagnostics(IntPtr hwnd)
+        {
+            if (hwnd == IntPtr.Zero) return new UrlRead { Error = "empty-handle" };
+            UrlRead result = null;
+            var thread = new Thread(() =>
+            {
+                try { result = ReadActiveUrlCore(hwnd); }
+                catch (Exception ex) { result = new UrlRead { Error = ex.GetType().Name + ": " + ex.Message }; }
+            });
+            thread.IsBackground = true;
+            thread.SetApartmentState(ApartmentState.STA);
+            thread.Start();
+            if (!thread.Join(3000))
+            {
+                return new UrlRead { Error = "timeout-3000ms" };
+            }
+            if (result == null) result = new UrlRead { Error = "unknown" };
+            result.Url = NormalizeUrl(result.Url);
+            return result;
+        }
+
+        /// <summary>并行读取多个窗口的地址，整体最多等 totalTimeoutMs，避免保存布局时被逐个卡住。</summary>
+        public static Dictionary<IntPtr, string> ReadActiveUrls(List<IntPtr> handles, int totalTimeoutMs)
+        {
+            var results = new Dictionary<IntPtr, string>();
+            if (handles == null || handles.Count == 0) return results;
+
+            var gate = new object();
+            var threads = new List<Thread>();
+            foreach (var hwnd in handles)
+            {
+                var handle = hwnd;
+                var thread = new Thread(() =>
+                {
+                    string value = null;
+                    try { value = NormalizeUrl(ReadActiveUrlCore(handle).Url); }
+                    catch { }
+                    lock (gate) { results[handle] = value; }
+                });
+                thread.IsBackground = true;
+                thread.SetApartmentState(ApartmentState.STA);
+                thread.Start();
+                threads.Add(thread);
+            }
+
+            var deadline = DateTime.UtcNow.AddMilliseconds(totalTimeoutMs);
+            foreach (var thread in threads)
+            {
+                var left = (int)(deadline - DateTime.UtcNow).TotalMilliseconds;
+                if (left > 0) thread.Join(left);
+            }
+
+            lock (gate) { return new Dictionary<IntPtr, string>(results); }
+        }
+
+        /// <summary>并行读出多个窗口的标签页网址，总耗时可控；单窗口读不到就返回空列表。</summary>
+        public static Dictionary<IntPtr, List<string>> ReadAllTabUrlsForWindows(List<IntPtr> handles, int maxTabs, int totalTimeoutMs)
+        {
+            var results = new Dictionary<IntPtr, List<string>>();
+            if (handles == null || handles.Count == 0) return results;
+
+            var gate = new object();
+            var threads = new List<Thread>();
+            foreach (var hwnd in handles)
+            {
+                var handle = hwnd;
+                var thread = new Thread(() =>
+                {
+                    List<string> value = null;
+                    try { value = ReadAllTabUrls(handle, maxTabs, totalTimeoutMs); }
+                    catch { }
+                    lock (gate) { results[handle] = value ?? new List<string>(); }
+                });
+                thread.IsBackground = true;
+                thread.SetApartmentState(ApartmentState.STA);
+                thread.Start();
+                threads.Add(thread);
+            }
+
+            var deadline = DateTime.UtcNow.AddMilliseconds(totalTimeoutMs);
+            foreach (var thread in threads)
+            {
+                var left = (int)(deadline - DateTime.UtcNow).TotalMilliseconds;
+                if (left > 0) thread.Join(left);
+            }
+
+            lock (gate) { return new Dictionary<IntPtr, List<string>>(results); }
+        }
+
+        /// <summary>
+        /// 读出窗口里所有标签页的网址：逐个用界面树选中标签再读地址栏，读完切回原来的标签。
+        /// 拿不到标签页（浏览器不暴露、或只有一个标签）时返回空列表，调用方退回“只记当前页”。
+        /// </summary>
+        public static List<string> ReadAllTabUrls(IntPtr hwnd, int maxTabs, int timeoutMs)
+        {
+            var result = new List<string>();
+            if (hwnd == IntPtr.Zero) return result;
+            try
+            {
+                var root = System.Windows.Automation.AutomationElement.FromHandle(hwnd);
+                if (root == null) return result;
+
+                // 先翻窗口顶部几层找标签条（快），翻不到再整棵树找一次，保证多标签不漏
+                var candidates = new List<System.Windows.Automation.AutomationElement>();
+                CollectElements(root, candidates, 0, 8, 200);
+
+                var list = new List<System.Windows.Automation.AutomationElement>();
+                foreach (var element in candidates)
+                {
+                    try
+                    {
+                        if (element.Current.ControlType == System.Windows.Automation.ControlType.TabItem) list.Add(element);
+                    }
+                    catch
+                    {
+                    }
+                }
+
+                if (list.Count < 2)
+                {
+                    var tabCondition = new System.Windows.Automation.PropertyCondition(
+                        System.Windows.Automation.AutomationElement.ControlTypeProperty,
+                        System.Windows.Automation.ControlType.TabItem);
+                    var probe = root.FindFirst(System.Windows.Automation.TreeScope.Descendants, tabCondition);
+                    if (probe != null)
+                    {
+                        list.Clear();
+                        foreach (System.Windows.Automation.AutomationElement element in
+                                 root.FindAll(System.Windows.Automation.TreeScope.Descendants, tabCondition))
+                        {
+                            list.Add(element);
+                        }
+                    }
+                }
+
+                if (list.Count < 2) return result;
+
+                // 先记下当前正在看的这一页，读完再切回去，不改变用户视线所在
+                var first = NormalizeUrl(ReadActiveUrl(hwnd));
+                if (!string.IsNullOrWhiteSpace(first)) result.Add(first);
+
+                System.Windows.Automation.AutomationElement original = null;
+                foreach (var tab in list)
+                {
+                    object pat;
+                    if (!tab.TryGetCurrentPattern(System.Windows.Automation.SelectionItemPattern.Pattern, out pat)) continue;
+                    try
+                    {
+                        if (((System.Windows.Automation.SelectionItemPattern)pat).Current.IsSelected)
+                        {
+                            original = tab;
+                            break;
+                        }
+                    }
+                    catch
+                    {
+                    }
+                }
+
+                var sw = Stopwatch.StartNew();
+                var done = 0;
+                foreach (var tab in list)
+                {
+                    if (done >= maxTabs || sw.ElapsedMilliseconds > timeoutMs) break;
+
+                    object pat;
+                    if (!tab.TryGetCurrentPattern(System.Windows.Automation.SelectionItemPattern.Pattern, out pat)) continue;
+
+                    var already = false;
+                    try { already = ((System.Windows.Automation.SelectionItemPattern)pat).Current.IsSelected; }
+                    catch { }
+                    if (already) { done++; continue; }
+
+                    try { ((System.Windows.Automation.SelectionItemPattern)pat).Select(); }
+                    catch { continue; }
+
+                    Thread.Sleep(120);
+                    var url = NormalizeUrl(ReadActiveUrl(hwnd));
+                    if (!string.IsNullOrWhiteSpace(url) && !result.Contains(url)) result.Add(url);
+                    done++;
+                }
+
+                if (original != null)
+                {
+                    object pat;
+                    if (original.TryGetCurrentPattern(System.Windows.Automation.SelectionItemPattern.Pattern, out pat))
+                    {
+                        try { ((System.Windows.Automation.SelectionItemPattern)pat).Select(); }
+                        catch { }
+                    }
+                }
+            }
+            catch
+            {
+            }
+            return result;
+        }
+
+        private static UrlRead ReadActiveUrlCore(IntPtr hwnd)
+        {
+            var read = new UrlRead();
+            var sw = Stopwatch.StartNew();
+            var root = System.Windows.Automation.AutomationElement.FromHandle(hwnd);
+            if (root == null)
+            {
+                read.Error = "no-automation-element";
+                read.Ms = (int)sw.ElapsedMilliseconds;
+                return read;
+            }
+
+            // 1) 浅层快路径：地址栏就在窗口顶部几层里，只翻这几层。
+            // 整棵树扫描（Descendants）在 ChatGPT 这种复杂页面上要好几秒，保存时会明显卡住。
+            var shallow = new List<System.Windows.Automation.AutomationElement>();
+            CollectElements(root, shallow, 0, 6, 150);
+
+            foreach (var element in shallow)
+            {
+                string id;
+                try { id = element.Current.AutomationId ?? ""; }
+                catch { continue; }
+                if (!IsOmniboxId(id)) continue;
+                read.Omnibox = true;
+                var value = TryGetValue(element);
+                if (string.IsNullOrWhiteSpace(value)) continue;
+                read.Url = value.Trim();
+                read.Ms = (int)sw.ElapsedMilliseconds;
+                return read;
+            }
+
+            foreach (var element in shallow)
+            {
+                string name;
+                try { name = element.Current.Name ?? ""; }
+                catch { continue; }
+                if (!IsOmniboxName(name)) continue;
+                read.Omnibox = true;
+                var value = TryGetValue(element);
+                if (string.IsNullOrWhiteSpace(value)) continue;
+                read.Url = value.Trim();
+                read.Ms = (int)sw.ElapsedMilliseconds;
+                return read;
+            }
+
+            // 2) 浅层没翻到（浏览器结构特殊）才退回整棵树定位
+            var omniboxIds = new[] { "view_1012", "view_1013", "view_1014", "omnibox" };
+            foreach (var id in omniboxIds)
+            {
+                var element = root.FindFirst(System.Windows.Automation.TreeScope.Descendants,
+                    new System.Windows.Automation.PropertyCondition(
+                        System.Windows.Automation.AutomationElement.AutomationIdProperty, id));
+                if (element == null) continue;
+                read.Omnibox = true;
+                var value = TryGetValue(element);
+                if (!string.IsNullOrWhiteSpace(value))
+                {
+                    read.Url = value.Trim();
+                    read.Ms = (int)sw.ElapsedMilliseconds;
+                    return read;
+                }
+            }
+
+            // 2) 按地址栏的显示名找
+            var omniboxNames = new[] { "地址和搜索栏", "Address and search bar" };
+            foreach (var text in omniboxNames)
+            {
+                var element = root.FindFirst(System.Windows.Automation.TreeScope.Descendants,
+                    new System.Windows.Automation.PropertyCondition(
+                        System.Windows.Automation.AutomationElement.NameProperty, text));
+                if (element == null) continue;
+                read.Omnibox = true;
+                var value = TryGetValue(element);
+                if (!string.IsNullOrWhiteSpace(value))
+                {
+                    read.Url = value.Trim();
+                    read.Ms = (int)sw.ElapsedMilliseconds;
+                    return read;
+                }
+            }
+
+            // 3) 页面根节点（RootWebArea）通常带完整网址
+            var webArea = root.FindFirst(System.Windows.Automation.TreeScope.Descendants,
+                new System.Windows.Automation.PropertyCondition(
+                    System.Windows.Automation.AutomationElement.AutomationIdProperty, "RootWebArea"));
+            if (webArea != null)
+            {
+                var value = TryGetValue(webArea);
+                if (!string.IsNullOrWhiteSpace(value) &&
+                    (value.StartsWith("http://", StringComparison.OrdinalIgnoreCase) ||
+                     value.StartsWith("https://", StringComparison.OrdinalIgnoreCase)))
+                {
+                    read.Url = value.Trim();
+                    read.Ms = (int)sw.ElapsedMilliseconds;
+                    return read;
+                }
+            }
+
+            // 4) 兜底：编辑框 / 整棵树里找第一个像网址的值
+            var all = root.FindAll(System.Windows.Automation.TreeScope.Descendants,
+                System.Windows.Automation.Condition.TrueCondition);
+            read.EditCount = all.Count;
+
+            string documentValue = null;
+            string anyHttpValue = null;
+
+            foreach (System.Windows.Automation.AutomationElement element in all)
+            {
+                string id = null;
+                string name = null;
+                string value = null;
+                try { id = element.Current.AutomationId; } catch { }
+                try { name = element.Current.Name; } catch { }
+                try
+                {
+                    object pattern;
+                    if (element.TryGetCurrentPattern(System.Windows.Automation.ValuePattern.Pattern, out pattern))
+                    {
+                        value = ((System.Windows.Automation.ValuePattern)pattern).Current.Value;
+                    }
+                }
+                catch { }
+
+                if (string.IsNullOrWhiteSpace(value)) continue;
+
+                var isOmnibox = IsOmniboxId(id) || IsOmniboxName(name);
+                if (isOmnibox)
+                {
+                    read.Omnibox = true;
+                    if (read.Url == null) read.Url = value.Trim();
+                }
+                else if (!string.IsNullOrWhiteSpace(id) && id.IndexOf("RootWebArea", StringComparison.OrdinalIgnoreCase) >= 0
+                         && string.IsNullOrWhiteSpace(documentValue)
+                         && (value.StartsWith("http://", StringComparison.OrdinalIgnoreCase) || value.StartsWith("https://", StringComparison.OrdinalIgnoreCase)))
+                {
+                    documentValue = value.Trim();
+                }
+                else if (string.IsNullOrWhiteSpace(anyHttpValue)
+                         && (value.StartsWith("http://", StringComparison.OrdinalIgnoreCase) || value.StartsWith("https://", StringComparison.OrdinalIgnoreCase)))
+                {
+                    anyHttpValue = value.Trim();
+                }
+            }
+
+            var picked = !string.IsNullOrWhiteSpace(read.Url) ? read.Url
+                       : !string.IsNullOrWhiteSpace(documentValue) ? documentValue
+                       : anyHttpValue;
+
+            if (string.IsNullOrWhiteSpace(picked))
+            {
+                read.Error = read.Omnibox ? "omnibox-empty" : "not-found";
+                read.Ms = (int)sw.ElapsedMilliseconds;
+                return read;
+            }
+
+            read.Url = picked;
+            read.Ms = (int)sw.ElapsedMilliseconds;
+            return read;
+        }
+
+        /// <summary>
+        /// Chrome / Edge 把窗口所属配置写在界面元素名里："标题 - Google Chrome - 配置名"。
+        /// 命令行里的 --profile-directory 只在浏览器冷启动时有效，进程跑起来后一律失效，所以以这里为准。
+        /// </summary>
+        /// <summary>上一次保存各阶段耗时（毫秒），用于排查保存卡在哪一步。</summary>
+        public static string LastTiming = "";
+
+        public static string DetectProfileName(IntPtr hwnd, out string rootName)
+        {
+            rootName = null;
+            try
+            {
+                var root = System.Windows.Automation.AutomationElement.FromHandle(hwnd);
+                if (root == null) return null;
+                rootName = root.Current.Name;
+
+                var candidates = new List<System.Windows.Automation.AutomationElement>();
+                CollectElements(root, candidates, 0, 3, 60);
+
+                foreach (var element in candidates)
+                {
+                    string name = null;
+                    try { name = element.Current.Name; } catch { }
+                    if (string.IsNullOrWhiteSpace(name)) continue;
+                    var match = Regex.Match(name, "^(.*?)\\s+-\\s+(Google Chrome|Microsoft Edge|Chromium|360[^\\s]*)\\s+-\\s+(.+)$");
+                    if (match.Success)
+                    {
+                        var profile = match.Groups[3].Value.Trim();
+                        if (profile.Length > 0) return profile;
+                    }
+                }
+            }
+            catch
+            {
+            }
+            return null;
+        }
+
+        private static void CollectElements(System.Windows.Automation.AutomationElement parent,
+            List<System.Windows.Automation.AutomationElement> result, int depth, int maxDepth, int maxCount)
+        {
+            if (depth >= maxDepth || result.Count >= maxCount) return;
+            System.Windows.Automation.AutomationElementCollection children;
+            try
+            {
+                children = parent.FindAll(System.Windows.Automation.TreeScope.Children,
+                    System.Windows.Automation.Condition.TrueCondition);
+            }
+            catch
+            {
+                return;
+            }
+
+            foreach (System.Windows.Automation.AutomationElement child in children)
+            {
+                if (child == null) continue;
+                result.Add(child);
+                if (result.Count >= maxCount) return;
+                CollectElements(child, result, depth + 1, maxDepth, maxCount);
+            }
+        }
+
+        /// <summary>窗口根节点名字：Chrome 会把它写成“页面标题 - Google Chrome - 配置名”。</summary>
+        public static string RootName(IntPtr hwnd)
+        {
+            try
+            {
+                var root = System.Windows.Automation.AutomationElement.FromHandle(hwnd);
+                if (root == null) return null;
+                return root.Current.Name;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static string TryGetValue(System.Windows.Automation.AutomationElement element)
+        {
+            try
+            {
+                object pattern;
+                if (element.TryGetCurrentPattern(System.Windows.Automation.ValuePattern.Pattern, out pattern))
+                {
+                    return ((System.Windows.Automation.ValuePattern)pattern).Current.Value;
+                }
+            }
+            catch
+            {
+            }
+            return null;
+        }
+
+        private static bool IsOmniboxId(string id)
+        {
+            if (string.IsNullOrWhiteSpace(id)) return false;
+            return EqualsIgnoreCase(id, "omnibox")
+                || EqualsIgnoreCase(id, "view_1012")
+                || EqualsIgnoreCase(id, "view_1013")
+                || EqualsIgnoreCase(id, "view_1014");
+        }
+
+        private static bool IsOmniboxName(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name)) return false;
+            return name.IndexOf("地址和搜索栏", StringComparison.OrdinalIgnoreCase) >= 0
+                || name.IndexOf("Address and search bar", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        /// <summary>导出窗口的自动化控件树，用于排查“地址栏到底暴露成什么”。</summary>
+        public static string DumpTree(IntPtr hwnd, int max)
+        {
+            var builder = new StringBuilder();
+            builder.AppendLine("[");
+            try
+            {
+                var root = System.Windows.Automation.AutomationElement.FromHandle(hwnd);
+                var all = root.FindAll(System.Windows.Automation.TreeScope.Descendants,
+                    System.Windows.Automation.Condition.TrueCondition);
+                var count = Math.Min(all.Count, max);
+                for (int i = 0; i < count; i++)
+                {
+                    var element = all[i] as System.Windows.Automation.AutomationElement;
+                    if (element == null) continue;
+                    var type = "";
+                    var id = "";
+                    var name = "";
+                    var value = "";
+                    try { type = element.Current.ControlType.ProgrammaticName; } catch { }
+                    try { id = element.Current.AutomationId; } catch { }
+                    try { name = element.Current.Name; } catch { }
+                    try
+                    {
+                        object pattern;
+                        if (element.TryGetCurrentPattern(System.Windows.Automation.ValuePattern.Pattern, out pattern))
+                        {
+                            value = ((System.Windows.Automation.ValuePattern)pattern).Current.Value;
+                        }
+                    }
+                    catch { }
+                    builder.Append("  {\"t\":\"").Append(JsonEscape(type))
+                           .Append("\",\"id\":\"").Append(JsonEscape(Truncate(id, 40)))
+                           .Append("\",\"n\":\"").Append(JsonEscape(Truncate(name, 60)))
+                           .Append("\",\"v\":\"").Append(JsonEscape(Truncate(value, 160)))
+                           .Append("\"}");
+                    if (i < count - 1) builder.AppendLine(","); else builder.AppendLine();
+                }
+            }
+            catch (Exception ex)
+            {
+                builder.AppendLine("  {\"error\":\"" + JsonEscape(ex.Message) + "\"}");
+            }
+            builder.AppendLine("]");
+            return builder.ToString();
+        }
+
+        private static string Truncate(string value, int max)
+        {
+            if (string.IsNullOrEmpty(value)) return "";
+            return value.Length <= max ? value : value.Substring(0, max);
+        }
+
+        private static string NormalizeUrl(string url)
+        {
+            if (string.IsNullOrWhiteSpace(url)) return null;
+            var value = url.Trim();
+            if (value.Length == 0) return null;
+            if (value.IndexOf(' ') >= 0 && value.IndexOf("://") < 0) return null; // 地址栏里是搜索词，不是网址
+            if (value.StartsWith("about:", StringComparison.OrdinalIgnoreCase)) return null;
+            if (value.StartsWith("chrome:", StringComparison.OrdinalIgnoreCase)) return null;
+            if (value.StartsWith("edge:", StringComparison.OrdinalIgnoreCase)) return null;
+            if (value.StartsWith("chrome-extension://", StringComparison.OrdinalIgnoreCase)) return null;
+            if (value.StartsWith("edge-extension://", StringComparison.OrdinalIgnoreCase)) return null;
+            if (value.StartsWith("view-source:", StringComparison.OrdinalIgnoreCase)) return null;
+
+            // 地址栏常常不带协议头（如 chatgpt.com/xxx），补全成 https
+            if (value.IndexOf("://") < 0)
+            {
+                if (value.IndexOf('.') < 0 && value.IndexOf(':') < 0) return null;
+                value = "https://" + value;
+            }
+            return value;
+        }
+
+        /// <summary>诊断用：把当前所有浏览器窗口的识别结果导出为 JSON。</summary>
+        public static string BuildReport()
+        {
+            var builder = new StringBuilder();
+            builder.AppendLine("[");
+            bool first = true;
+            foreach (var window in WindowTools.GetTopLevelWindows().Where(w => !w.IsMinimized))
+            {
+                var info = Probe(window.ProcessId, window.ExePath, window.Title, window.Hwnd);
+                if (info == null) continue;
+                if (first) dumpFirstWindowHwnd = window.Hwnd;
+                if (!first) builder.AppendLine(",");
+                first = false;
+                var urlRead = ReadActiveUrlWithDiagnostics(window.Hwnd);
+                string treeRoot;
+                var treeProfile = DetectProfileName(window.Hwnd, out treeRoot);
+                var tabUrls = ReadAllTabUrls(window.Hwnd, 12, 2500);
+                var tabUrlsText = new StringBuilder();
+                foreach (var tabUrl in tabUrls)
+                {
+                    if (tabUrlsText.Length > 0) tabUrlsText.Append(" , ");
+                    tabUrlsText.Append(tabUrl);
+                }
+                builder.Append("  {\"title\":\"").Append(JsonEscape(window.Title))
+                       .Append("\",\"process\":\"").Append(JsonEscape(window.ProcessName))
+                       .Append("\",\"pid\":").Append(window.ProcessId)
+                       .Append(",\"family\":\"").Append(JsonEscape(info.Family))
+                       .Append("\",\"profile\":\"").Append(JsonEscape(info.Profile))
+                       .Append("\",\"profile_name\":\"").Append(JsonEscape(info.ProfileName))
+                       .Append("\",\"exe\":\"").Append(JsonEscape(info.ExePath))
+                       .Append("\",\"url\":\"").Append(JsonEscape(urlRead.Url ?? ""))
+                       .Append("\",\"omnibox\":").Append(urlRead.Omnibox ? "true" : "false")
+                       .Append(",\"edits\":").Append(urlRead.EditCount)
+                       .Append(",\"ms\":").Append(urlRead.Ms)
+                       .Append(",\"root\":\"").Append(JsonEscape(RootName(window.Hwnd) ?? "")).Append("\"")
+                       .Append(",\"treeprofile\":\"").Append(JsonEscape(treeProfile ?? "")).Append("\"")
+                       .Append(",\"tabs\":").Append(tabUrls.Count)
+                       .Append(",\"taburls\":\"").Append(JsonEscape(tabUrlsText.ToString())).Append("\"")
+                       .Append(",\"why\":\"").Append(JsonEscape(urlRead.Error ?? ""))
+                       .Append("\"}");
+            }
+            builder.AppendLine();
+            builder.AppendLine("]");
+
+            if (dumpFirstWindowHwnd != IntPtr.Zero)
+            {
+                builder.AppendLine("--- tree ---");
+                builder.Append(DumpTree(dumpFirstWindowHwnd, 120));
+            }
+            return builder.ToString();
+        }
+
+        internal static IntPtr dumpFirstWindowHwnd = IntPtr.Zero;
+
+        private static string JsonEscape(string value)
+        {
+            if (string.IsNullOrEmpty(value)) return "";
+            var builder = new StringBuilder(value.Length + 8);
+            foreach (var c in value)
+            {
+                switch (c)
+                {
+                    case '\\': builder.Append("\\\\"); break;
+                    case '"': builder.Append("\\\""); break;
+                    case '\r': builder.Append("\\r"); break;
+                    case '\n': builder.Append("\\n"); break;
+                    case '\t': builder.Append("\\t"); break;
+                    default:
+                        if (c < ' ') builder.Append("\\u").Append(((int)c).ToString("x4"));
+                        else builder.Append(c);
+                        break;
+                }
+            }
+            return builder.ToString();
+        }
+
+        public static string KeywordFromTitle(string title)
+        {
+            var value = (title ?? "").Trim();
+            var suffixes = new[]
+            {
+                " - Google Chrome", " - Microsoft Edge", " - Chromium", " - 比特浏览器", " - BitBrowser",
+                " - 360极速浏览器", " - 360安全浏览器", " - QQ浏览器"
+            };
+            foreach (var suffix in suffixes)
+            {
+                if (value.EndsWith(suffix, StringComparison.OrdinalIgnoreCase))
+                {
+                    value = value.Substring(0, value.Length - suffix.Length).Trim();
+                    break;
+                }
+            }
+            if (value.Length > 60) value = value.Substring(0, 60);
+            return value;
+        }
+    }
+
+    /// <summary>读取 Chrome / Edge 的配置显示名。</summary>
+    public static class ChromeProfiles
+    {
+        private static readonly object Sync = new object();
+        private static readonly Dictionary<string, string> Cache = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        public static string GetDisplayName(string family, string profileDirectory)
+        {
+            if (string.IsNullOrWhiteSpace(profileDirectory)) return "";
+            var key = (family ?? "") + "|" + profileDirectory;
+            lock (Sync)
+            {
+                string hit;
+                if (Cache.TryGetValue(key, out hit)) return hit;
+            }
+
+            var name = ReadName(family, profileDirectory);
+            lock (Sync) { Cache[key] = name; }
+            return name;
+        }
+
+        private class ProfileEntry
+        {
+            public string Dir;
+            public string Name;
+            public string UserName;
+        }
+
+        // Local State 有几 MB，每个窗口都读一遍会让保存卡好几秒，这里整个进程只解析一次
+        private static readonly object StateSync = new object();
+        private static readonly Dictionary<string, List<ProfileEntry>> StateCache =
+            new Dictionary<string, List<ProfileEntry>>(StringComparer.OrdinalIgnoreCase);
+        private static DateTime stateStamp = DateTime.MinValue;
+
+        private static List<ProfileEntry> LoadEntries(string family)
+        {
+            lock (StateSync)
+            {
+                if (DateTime.UtcNow - stateStamp < TimeSpan.FromMinutes(5))
+                {
+                    List<ProfileEntry> hit;
+                    if (StateCache.TryGetValue(family, out hit)) return hit;
+                }
+                else
+                {
+                    StateCache.Clear();
+                }
+
+                var list = ParseEntries(family);
+                stateStamp = DateTime.UtcNow;
+                StateCache[family] = list;
+                return list;
+            }
+        }
+
+        private static List<ProfileEntry> ParseEntries(string family)
+        {
+            var list = new List<ProfileEntry>();
+            try
+            {
+                var local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+                var userData = EqualsIgnoreCase(family, "edge")
+                    ? System.IO.Path.Combine(local, "Microsoft", "Edge", "User Data")
+                    : System.IO.Path.Combine(local, "Google", "Chrome", "User Data");
+                var statePath = System.IO.Path.Combine(userData, "Local State");
+                if (!File.Exists(statePath)) return list;
+
+                var json = File.ReadAllText(statePath, Encoding.UTF8);
+                // info_cache 里形如 "Profile 27":{"name":"GPT1半价-曹",...}
+                foreach (Match block in Regex.Matches(json, "\"(Profile \\d+|Default)\"\\s*:\\s*\\{[^{}]*\\}"))
+                {
+                    var body = block.Value;
+                    var dir = Regex.Match(body, "\"(Profile \\d+|Default)\"\\s*:").Groups[1].Value;
+                    var nameMatch = Regex.Match(body, "\"name\"\\s*:\\s*\"([^\"]*)\"");
+                    var userMatch = Regex.Match(body, "\"user_name\"\\s*:\\s*\"([^\"]*)\"");
+                    list.Add(new ProfileEntry
+                    {
+                        Dir = dir,
+                        Name = DecodeJsonString(nameMatch.Success ? nameMatch.Groups[1].Value : ""),
+                        UserName = DecodeJsonString(userMatch.Success ? userMatch.Groups[1].Value : "")
+                    });
+                }
+            }
+            catch
+            {
+            }
+            return list;
+        }
+
+        /// <summary>按界面树里读到的配置显示名反查配置目录（Profile 27 之类），用于冷启动时按配置打开。</summary>
+        public static string FindDirectory(string family, string displayName, string fallbackDirectory)
+        {
+            if (string.IsNullOrWhiteSpace(displayName)) return fallbackDirectory ?? "";
+            try
+            {
+                foreach (var entry in LoadEntries(family))
+                {
+                    if (BrowserProbe.NamesCompatible(entry.Name, displayName)) return entry.Dir;
+                    if (!string.IsNullOrWhiteSpace(entry.UserName) && BrowserProbe.NamesCompatible(entry.UserName, displayName)) return entry.Dir;
+                }
+            }
+            catch
+            {
+            }
+            return fallbackDirectory ?? "";
+        }
+
+        private static string ReadName(string family, string profileDirectory)
+        {
+            try
+            {
+                foreach (var entry in LoadEntries(family))
+                {
+                    if (!EqualsIgnoreCase(entry.Dir, profileDirectory)) continue;
+                    return string.IsNullOrWhiteSpace(entry.Name) ? profileDirectory : entry.Name;
+                }
+            }
+            catch
+            {
+            }
+            return profileDirectory;
+        }
+
+        private static string DecodeJsonString(string value)
+        {
+            if (string.IsNullOrEmpty(value) || value.IndexOf('\\') < 0) return value;
+            return Regex.Replace(value, "\\\\u([0-9a-fA-F]{4})", m => ((char)Convert.ToInt32(m.Groups[1].Value, 16)).ToString());
+        }
+
+        private static bool EqualsIgnoreCase(string a, string b)
+        {
+            return string.Equals(a ?? "", b ?? "", StringComparison.OrdinalIgnoreCase);
+        }
+    }
+
+    /// <summary>比特浏览器本地接口：按环境 ID 打开环境。</summary>
+    public static class BitBrowserApi
+    {
+        private const string BaseUrl = "http://127.0.0.1:54345";
+        private static readonly object Sync = new object();
+        private static List<BitEnv> cache;
+        private static DateTime cacheStamp = DateTime.MinValue;
+
+        [DataContract]
+        public class BitEnv
+        {
+            [DataMember(Name = "id")] public string Id { get; set; }
+            [DataMember(Name = "name")] public string Name { get; set; }
+            [DataMember(Name = "remark")] public string Remark { get; set; }
+            [DataMember(Name = "seq")] public int Seq { get; set; }
+        }
+
+        private static bool EqualsIgnoreCase(string a, string b)
+        {
+            return string.Equals(a ?? "", b ?? "", StringComparison.OrdinalIgnoreCase);
+        }
+
+        [DataContract]
+        private class BitListResponse
+        {
+            [DataMember(Name = "code")] public int Code { get; set; }
+            [DataMember(Name = "data")] public BitListData Data { get; set; }
+        }
+
+        [DataContract]
+        private class BitListData
+        {
+            [DataMember(Name = "list")] public List<BitEnv> List { get; set; }
+        }
+
+        [DataContract]
+        private class BitOpenResponse
+        {
+            [DataMember(Name = "code")] public int Code { get; set; }
+            [DataMember(Name = "msg")] public string Msg { get; set; }
+        }
+
+        public static List<BitEnv> ListEnvironments()
+        {
+            lock (Sync)
+            {
+                if (cache != null && DateTime.UtcNow - cacheStamp < TimeSpan.FromSeconds(30)) return cache;
+            }
+
+            var list = new List<BitEnv>();
+            try
+            {
+                var json = Post("/browser/list", "{\"page\":0,\"pageSize\":200}");
+                if (!string.IsNullOrWhiteSpace(json))
+                {
+                    using (var stream = new MemoryStream(Encoding.UTF8.GetBytes(json)))
+                    {
+                        var serializer = new DataContractJsonSerializer(typeof(BitListResponse));
+                        var response = serializer.ReadObject(stream) as BitListResponse;
+                        if (response != null && response.Data != null && response.Data.List != null)
+                        {
+                            list = response.Data.List;
+                        }
+                    }
+                }
+            }
+            catch
+            {
+            }
+
+            lock (Sync)
+            {
+                cache = list;
+                cacheStamp = DateTime.UtcNow;
+            }
+            return list;
+        }
+
+        public static string ResolveEnvironmentId(string windowTitle, string userDataDir)
+        {
+            var list = ListEnvironments();
+            if (list.Count == 0) return null;
+
+            var title = windowTitle ?? "";
+            string bestId = null;
+            int bestLength = 0;
+            foreach (var env in list)
+            {
+                if (env == null || string.IsNullOrWhiteSpace(env.Name)) continue;
+                if (title.IndexOf(env.Name, StringComparison.OrdinalIgnoreCase) >= 0 && env.Name.Length > bestLength)
+                {
+                    bestId = env.Id;
+                    bestLength = env.Name.Length;
+                }
+            }
+            if (!string.IsNullOrWhiteSpace(bestId)) return bestId;
+
+            if (!string.IsNullOrWhiteSpace(userDataDir))
+            {
+                foreach (var env in list)
+                {
+                    if (env == null || string.IsNullOrWhiteSpace(env.Id)) continue;
+                    if (userDataDir.IndexOf(env.Id, StringComparison.OrdinalIgnoreCase) >= 0) return env.Id;
+                }
+            }
+            return null;
+        }
+
+        public static string NameOf(string envId, string fallback)
+        {
+            var list = ListEnvironments();
+            var env = list.FirstOrDefault(x => x != null && EqualsIgnoreCase(x.Id, envId));
+            if (env != null && !string.IsNullOrWhiteSpace(env.Name)) return env.Name;
+            return string.IsNullOrWhiteSpace(fallback) ? envId : fallback;
+        }
+
+        public static bool OpenEnvironment(string envId, out string error)
+        {
+            error = null;
+            if (string.IsNullOrWhiteSpace(envId))
+            {
+                error = "缺少环境 ID";
+                return false;
+            }
+
+            try
+            {
+                var json = Post("/browser/open", "{\"id\":\"" + envId.Replace("\"", "") + "\"}");
+                if (string.IsNullOrWhiteSpace(json))
+                {
+                    error = "本地接口没有响应（比特浏览器未启动？）";
+                    return false;
+                }
+                using (var stream = new MemoryStream(Encoding.UTF8.GetBytes(json)))
+                {
+                    var serializer = new DataContractJsonSerializer(typeof(BitOpenResponse));
+                    var response = serializer.ReadObject(stream) as BitOpenResponse;
+                    if (response != null && response.Code == 0) return true;
+                    error = response == null ? "返回内容无法识别" : (string.IsNullOrWhiteSpace(response.Msg) ? "接口返回 code=" + response.Code : response.Msg);
+                    return false;
+                }
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                return false;
+            }
+        }
+
+        private static string Post(string path, string body)
+        {
+            var request = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(BaseUrl + path);
+            request.Method = "POST";
+            request.ContentType = "application/json";
+            request.Timeout = 3000;
+            request.ReadWriteTimeout = 3000;
+            var bytes = Encoding.UTF8.GetBytes(body ?? "{}");
+            request.ContentLength = bytes.Length;
+            using (var stream = request.GetRequestStream())
+            {
+                stream.Write(bytes, 0, bytes.Length);
+            }
+            using (var response = (System.Net.HttpWebResponse)request.GetResponse())
+            using (var reader = new StreamReader(response.GetResponseStream(), Encoding.UTF8))
+            {
+                return reader.ReadToEnd();
+            }
+        }
+    }
+
+    public static class ProcessQuery
+    {
+        public static string GetCommandLine(int processId, out string executablePath)
+        {
+            executablePath = null;
+            try
+            {
+                using (var searcher = new System.Management.ManagementObjectSearcher(
+                    "SELECT CommandLine, ExecutablePath FROM Win32_Process WHERE ProcessId=" + processId))
+                using (var results = searcher.Get())
+                {
+                    foreach (System.Management.ManagementObject item in results)
+                    {
+                        executablePath = Convert.ToString(item["ExecutablePath"]);
+                        return Convert.ToString(item["CommandLine"]);
+                    }
+                }
+            }
+            catch
+            {
+            }
+            return null;
         }
     }
 
@@ -1225,6 +3126,102 @@ namespace WindowLayoutLauncher
         [DllImport("user32.dll")]
         public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
 
+        [DllImport("user32.dll")]
+        public static extern bool SetForegroundWindow(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        public static extern IntPtr GetForegroundWindow();
+
+        [DllImport("user32.dll")]
+        public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+
+        [DllImport("user32.dll")]
+        public static extern IntPtr SetFocus(IntPtr hWnd);
+
+        /// <summary>把窗口拉到前台；抢不到焦点就返回 false，避免后面的键盘输入打到别的程序里。</summary>
+        public static bool ForceForeground(IntPtr hwnd)
+        {
+            if (hwnd == IntPtr.Zero) return false;
+            try
+            {
+                if (GetForegroundWindow() == hwnd) return true;
+                SetForegroundWindow(hwnd);
+                if (GetForegroundWindow() == hwnd) return true;
+
+                uint pid;
+                var targetThread = GetWindowThreadProcessId(hwnd, out pid);
+                var foreground = GetForegroundWindow();
+                var foregroundThread = foreground == IntPtr.Zero ? 0 : GetWindowThreadProcessId(foreground, out pid);
+                if (targetThread != 0 && foregroundThread != 0 && targetThread != foregroundThread)
+                {
+                    AttachThreadInput(foregroundThread, targetThread, true);
+                    SetForegroundWindow(hwnd);
+                    SetFocus(hwnd);
+                    AttachThreadInput(foregroundThread, targetThread, false);
+                }
+            }
+            catch
+            {
+            }
+            return GetForegroundWindow() == hwnd;
+        }
+
+        /// <summary>把窗口激活后，用地址栏打开一个网址（比特浏览器等无法用命令行加标签时使用）。</summary>
+        public static void NavigateInWindow(IntPtr hwnd, string url)
+        {
+            if (hwnd == IntPtr.Zero || string.IsNullOrWhiteSpace(url)) return;
+            try
+            {
+                ShowWindowAsync(hwnd, 9);
+                Thread.Sleep(140);
+                if (!ForceForeground(hwnd)) return;
+                Thread.Sleep(80);
+                SendKeys.SendWait("^l");
+                Thread.Sleep(130);
+
+                bool pasted = false;
+                for (int i = 0; i < 3 && !pasted; i++)
+                {
+                    try
+                    {
+                        Clipboard.SetText(url);
+                        pasted = true;
+                    }
+                    catch
+                    {
+                        Thread.Sleep(100);
+                    }
+                }
+
+                if (pasted) SendKeys.SendWait("^v");
+                else SendKeys.SendWait(EscapeSendKeys(url));
+                Thread.Sleep(100);
+                SendKeys.SendWait("{ENTER}");
+                Thread.Sleep(260);
+            }
+            catch
+            {
+            }
+        }
+
+        private static string EscapeSendKeys(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return "";
+            var builder = new StringBuilder(text.Length + 8);
+            foreach (var c in text)
+            {
+                if ("+^%~(){}[]".IndexOf(c) >= 0) builder.Append('{').Append(c).Append('}');
+                else builder.Append(c);
+            }
+            return builder.ToString();
+        }
+
+        [DllImport("user32.dll")]
+        public static extern int RegisterWindowMessage(string lpString);
+
+        [DllImport("user32.dll")]
+        public static extern bool PostMessage(IntPtr hWnd, int Msg, IntPtr wParam, IntPtr lParam);
+
         [DllImport("dwmapi.dll")]
         public static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int attrValue, int attrSize);
 
@@ -1233,6 +3230,270 @@ namespace WindowLayoutLauncher
 
         [DllImport("shcore.dll")]
         public static extern int SetProcessDpiAwareness(int awareness);
+    }
+
+    public static class TaskbarIntegration
+    {
+        private const string AppId = "Zwm.WindowLayoutLauncher";
+
+        private static readonly PropertyKey AppIdKey = new PropertyKey(
+            new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3"), 5);
+        private static readonly PropertyKey TitleKey = new PropertyKey(
+            new Guid("F29F85E0-4FF9-1068-AB91-08002B27B3D9"), 2);
+
+        public static void Initialize()
+        {
+            try
+            {
+                SetCurrentProcessExplicitAppUserModelID(AppId);
+            }
+            catch
+            {
+            }
+        }
+
+        public static void UpdateJumpList(IEnumerable<LayoutSummary> layouts)
+        {
+            try
+            {
+                EnsureShortcutIdentities();
+
+                ICustomDestinationList destination = (ICustomDestinationList)new DestinationList();
+                destination.SetAppID(AppId);
+                uint maxSlots;
+                object removed;
+                Guid objectArrayId = typeof(IObjectArray).GUID;
+                destination.BeginList(out maxSlots, ref objectArrayId, out removed);
+                ReleaseComObject(removed);
+
+                var layoutList = (layouts ?? Enumerable.Empty<LayoutSummary>())
+                    .Where(x => x != null && !string.IsNullOrWhiteSpace(x.Name))
+                    .Take(maxSlots == 0 ? 12 : (int)maxSlots)
+                    .ToList();
+                if (layoutList.Count > 0)
+                {
+                    IObjectCollection collection = (IObjectCollection)new EnumerableObjectCollection();
+                    foreach (var layout in layoutList)
+                    {
+                        string label = string.IsNullOrWhiteSpace(layout.TaskMode)
+                            ? layout.Name
+                            : layout.TaskMode + "  |  " + layout.Name;
+                        collection.AddObject(CreateLink(label, "--restore \"" + layout.Name.Replace("\"", "\\\"") + "\""));
+                    }
+                    destination.AppendCategory("已保存布局", (IObjectArray)collection);
+                    ReleaseComObject(collection);
+                }
+
+                IObjectCollection tasks = (IObjectCollection)new EnumerableObjectCollection();
+                tasks.AddObject(CreateLink("打开布局中心", ""));
+                destination.AddUserTasks((IObjectArray)tasks);
+                ReleaseComObject(tasks);
+
+                destination.CommitList();
+                ReleaseComObject(destination);
+            }
+            catch
+            {
+            }
+        }
+
+        private static object CreateLink(string title, string arguments)
+        {
+            IShellLinkW link = (IShellLinkW)new ShellLink();
+            string exe = Application.ExecutablePath;
+            link.SetPath(exe);
+            link.SetArguments(arguments ?? "");
+            link.SetWorkingDirectory(AppDomain.CurrentDomain.BaseDirectory);
+            link.SetIconLocation(exe, 0);
+            link.SetDescription(title);
+            SetStringProperty((IPropertyStore)link, TitleKey, title);
+            return link;
+        }
+
+        private static void EnsureShortcutIdentities()
+        {
+            var folders = new List<string>();
+            folders.Add(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory));
+            folders.Add(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                "Microsoft", "Internet Explorer", "Quick Launch", "User Pinned", "TaskBar"));
+
+            foreach (var folder in folders.Distinct(StringComparer.OrdinalIgnoreCase))
+            {
+                if (string.IsNullOrWhiteSpace(folder) || !Directory.Exists(folder)) continue;
+                foreach (var shortcut in Directory.GetFiles(folder, "*.lnk"))
+                {
+                    UpdateShortcutIdentity(shortcut);
+                }
+            }
+        }
+
+        private static void UpdateShortcutIdentity(string shortcutPath)
+        {
+            IShellLinkW link = null;
+            try
+            {
+                link = (IShellLinkW)new ShellLink();
+                IPersistFile file = (IPersistFile)link;
+                file.Load(shortcutPath, 2);
+                var target = new StringBuilder(1024);
+                link.GetPath(target, target.Capacity, IntPtr.Zero, 0);
+                if (!string.Equals(FullPath(target.ToString()), FullPath(Application.ExecutablePath), StringComparison.OrdinalIgnoreCase))
+                    return;
+
+                SetStringProperty((IPropertyStore)link, AppIdKey, AppId);
+                file.Save(shortcutPath, true);
+            }
+            catch
+            {
+            }
+            finally
+            {
+                ReleaseComObject(link);
+            }
+        }
+
+        private static string FullPath(string path)
+        {
+            try { return Path.GetFullPath(path ?? "").TrimEnd('\\'); }
+            catch { return path ?? ""; }
+        }
+
+        private static void SetStringProperty(IPropertyStore store, PropertyKey key, string value)
+        {
+            PropVariant variant = PropVariant.FromString(value ?? "");
+            try
+            {
+                store.SetValue(ref key, ref variant);
+                store.Commit();
+            }
+            finally
+            {
+                variant.Clear();
+            }
+        }
+
+        private static void ReleaseComObject(object value)
+        {
+            if (value != null && Marshal.IsComObject(value))
+            {
+                try { Marshal.FinalReleaseComObject(value); }
+                catch { }
+            }
+        }
+
+        [DllImport("shell32.dll")]
+        private static extern int SetCurrentProcessExplicitAppUserModelID([MarshalAs(UnmanagedType.LPWStr)] string appId);
+
+        [StructLayout(LayoutKind.Sequential, Pack = 4)]
+        private struct PropertyKey
+        {
+            public Guid FormatId;
+            public uint PropertyId;
+
+            public PropertyKey(Guid formatId, uint propertyId)
+            {
+                FormatId = formatId;
+                PropertyId = propertyId;
+            }
+        }
+
+        [StructLayout(LayoutKind.Explicit)]
+        private struct PropVariant
+        {
+            [FieldOffset(0)] public ushort VariantType;
+            [FieldOffset(8)] public IntPtr PointerValue;
+
+            public static PropVariant FromString(string value)
+            {
+                return new PropVariant
+                {
+                    VariantType = 31,
+                    PointerValue = Marshal.StringToCoTaskMemUni(value)
+                };
+            }
+
+            public void Clear()
+            {
+                PropVariantClear(ref this);
+            }
+        }
+
+        [DllImport("ole32.dll")]
+        private static extern int PropVariantClear(ref PropVariant value);
+
+        [ComImport, Guid("6332DEBF-87B5-4670-90C0-5E57B408A49E"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        private interface ICustomDestinationList
+        {
+            void SetAppID([MarshalAs(UnmanagedType.LPWStr)] string appId);
+            void BeginList(out uint maxSlots, ref Guid interfaceId, [MarshalAs(UnmanagedType.Interface)] out object removedItems);
+            void AppendCategory([MarshalAs(UnmanagedType.LPWStr)] string category, IObjectArray items);
+            void AppendKnownCategory(uint category);
+            void AddUserTasks(IObjectArray tasks);
+            void CommitList();
+            void GetRemovedDestinations(ref Guid interfaceId, [MarshalAs(UnmanagedType.Interface)] out object removedItems);
+            void DeleteList([MarshalAs(UnmanagedType.LPWStr)] string appId);
+            void AbortList();
+        }
+
+        [ComImport, Guid("92CA9DCD-5622-4BBA-A805-5E9F541BD8C9"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        private interface IObjectArray
+        {
+            void GetCount(out uint count);
+            void GetAt(uint index, ref Guid interfaceId, [MarshalAs(UnmanagedType.Interface)] out object value);
+        }
+
+        [ComImport, Guid("5632B1A4-E38A-400A-928A-D4CD63230295"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        private interface IObjectCollection
+        {
+            void GetCount(out uint count);
+            void GetAt(uint index, ref Guid interfaceId, [MarshalAs(UnmanagedType.Interface)] out object value);
+            void AddObject([MarshalAs(UnmanagedType.IUnknown)] object value);
+            void AddFromArray(IObjectArray source);
+            void RemoveObjectAt(uint index);
+            void Clear();
+        }
+
+        [ComImport, Guid("000214F9-0000-0000-C000-000000000046"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        private interface IShellLinkW
+        {
+            void GetPath([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder path, int pathLength, IntPtr findData, uint flags);
+            void GetIDList(out IntPtr itemIdList);
+            void SetIDList(IntPtr itemIdList);
+            void GetDescription([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder description, int maxLength);
+            void SetDescription([MarshalAs(UnmanagedType.LPWStr)] string description);
+            void GetWorkingDirectory([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder directory, int maxLength);
+            void SetWorkingDirectory([MarshalAs(UnmanagedType.LPWStr)] string directory);
+            void GetArguments([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder arguments, int maxLength);
+            void SetArguments([MarshalAs(UnmanagedType.LPWStr)] string arguments);
+            void GetHotkey(out short hotkey);
+            void SetHotkey(short hotkey);
+            void GetShowCmd(out int showCommand);
+            void SetShowCmd(int showCommand);
+            void GetIconLocation([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder iconPath, int iconPathLength, out int iconIndex);
+            void SetIconLocation([MarshalAs(UnmanagedType.LPWStr)] string iconPath, int iconIndex);
+            void SetRelativePath([MarshalAs(UnmanagedType.LPWStr)] string path, uint reserved);
+            void Resolve(IntPtr window, uint flags);
+            void SetPath([MarshalAs(UnmanagedType.LPWStr)] string path);
+        }
+
+        [ComImport, Guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        private interface IPropertyStore
+        {
+            void GetCount(out uint propertyCount);
+            void GetAt(uint propertyIndex, out PropertyKey key);
+            void GetValue(ref PropertyKey key, out PropVariant value);
+            void SetValue(ref PropertyKey key, ref PropVariant value);
+            void Commit();
+        }
+
+        [ComImport, Guid("77F10CF0-3DB5-4966-B520-B7C54FD35ED6")]
+        private class DestinationList { }
+
+        [ComImport, Guid("2D3468C1-36A7-43B6-AC24-D3F02FD9607A")]
+        private class EnumerableObjectCollection { }
+
+        [ComImport, Guid("00021401-0000-0000-C000-000000000046")]
+        private class ShellLink { }
     }
 
     public static class UiTheme
@@ -1425,12 +3686,19 @@ namespace WindowLayoutLauncher
         private Label statusLabel;
         private GlassPanel card;
         private GlassButton openButton;
+        private NotifyIcon trayIcon;
+        private ContextMenuStrip trayMenu;
+        private bool allowExit;
+        private string pendingTaskMode;
+        private DateTime ignoreMinimizeUntilUtc;
 
         public MainForm(LayoutManager manager)
         {
             this.manager = manager;
+            ignoreMinimizeUntilUtc = DateTime.UtcNow.AddMilliseconds(1200);
             Initialize();
             RefreshLayouts();
+            InitializeTray();
         }
 
         private void Initialize()
@@ -1438,11 +3706,12 @@ namespace WindowLayoutLauncher
             AutoScaleMode = AutoScaleMode.None;
             Text = "窗口布局启动器";
             StartPosition = FormStartPosition.CenterScreen;
-            ClientSize = new Size(760, 600);
-            MinimumSize = new Size(620, 460);
+            ClientSize = new Size(820, 650);
+            MinimumSize = new Size(640, 500);
             BackColor = UiTheme.WindowBottom;
             Font = new Font("Microsoft YaHei UI", 9F);
             DoubleBuffered = true;
+            KeyPreview = true;
             TrySetWindowIcon();
             Shown += (s, e) => CenterOnPrimaryScreen();
 
@@ -1491,13 +3760,13 @@ namespace WindowLayoutLauncher
             body.ColumnCount = 2;
             body.RowCount = 1;
             body.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
-            body.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 190F));
+            body.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 214F));
             body.Margin = new Padding(0, 8, 0, 10);
             root.Controls.Add(body, 0, 3);
 
             card = new GlassPanel();
             card.Dock = DockStyle.Fill;
-            card.Margin = new Padding(0, 0, 28, 0);
+            card.Margin = new Padding(0, 0, 20, 0);
             card.Padding = new Padding(22);
             card.FillColor = UiTheme.Panel;
             body.Controls.Add(card, 0, 0);
@@ -1509,32 +3778,56 @@ namespace WindowLayoutLauncher
             listBox.ForeColor = UiTheme.Ink;
             listBox.BorderStyle = BorderStyle.None;
             listBox.DrawMode = DrawMode.OwnerDrawFixed;
-            listBox.ItemHeight = 76;
+            listBox.ItemHeight = 104;
             listBox.IntegralHeight = false;
             listBox.DrawItem += DrawLayoutItem;
             listBox.DoubleClick += (s, e) => RestoreSelected();
+            listBox.SelectedIndexChanged += (s, e) => UpdateSelectedLayoutUi();
+            listBox.KeyDown += (s, e) =>
+            {
+                if (e.KeyCode == Keys.Enter)
+                {
+                    RestoreSelected();
+                    e.Handled = true;
+                    e.SuppressKeyPress = true;
+                }
+                else if (e.KeyCode == Keys.F5)
+                {
+                    RefreshLayouts();
+                    e.Handled = true;
+                }
+            };
             card.Controls.Add(listBox);
 
+            var actionScroll = new Panel();
+            actionScroll.Dock = DockStyle.Fill;
+            actionScroll.BackColor = Color.Transparent;
+            actionScroll.AutoScroll = true;
+            actionScroll.AutoScrollMinSize = new Size(0, 412);
+            actionScroll.Margin = new Padding(0);
+            body.Controls.Add(actionScroll, 1, 0);
+
             var actions = new TableLayoutPanel();
-            actions.Dock = DockStyle.Fill;
+            actions.Dock = DockStyle.Top;
+            actions.Height = 448;
             actions.BackColor = Color.Transparent;
-            actions.AutoScroll = true;
+            actions.AutoScroll = false;
             actions.ColumnCount = 1;
             actions.RowCount = 9;
-            actions.RowStyles.Add(new RowStyle(SizeType.Absolute, 42F));
-            actions.RowStyles.Add(new RowStyle(SizeType.Absolute, 14F));
-            actions.RowStyles.Add(new RowStyle(SizeType.Absolute, 164F));
-            actions.RowStyles.Add(new RowStyle(SizeType.Absolute, 14F));
-            actions.RowStyles.Add(new RowStyle(SizeType.Absolute, 92F));
-            actions.RowStyles.Add(new RowStyle(SizeType.Absolute, 14F));
-            actions.RowStyles.Add(new RowStyle(SizeType.Absolute, 128F));
-            actions.RowStyles.Add(new RowStyle(SizeType.Absolute, 14F));
-            actions.RowStyles.Add(new RowStyle(SizeType.Absolute, 56F));
-            body.Controls.Add(actions, 1, 0);
+            actions.RowStyles.Add(new RowStyle(SizeType.Absolute, 38F));
+            actions.RowStyles.Add(new RowStyle(SizeType.Absolute, 12F));
+            actions.RowStyles.Add(new RowStyle(SizeType.Absolute, 144F));
+            actions.RowStyles.Add(new RowStyle(SizeType.Absolute, 12F));
+            actions.RowStyles.Add(new RowStyle(SizeType.Absolute, 108F));
+            actions.RowStyles.Add(new RowStyle(SizeType.Absolute, 12F));
+            actions.RowStyles.Add(new RowStyle(SizeType.Absolute, 72F));
+            actions.RowStyles.Add(new RowStyle(SizeType.Absolute, 12F));
+            actions.RowStyles.Add(new RowStyle(SizeType.Absolute, 38F));
+            actionScroll.Controls.Add(actions);
 
             openButton = AddButton(actions, "打开布局", 0, 0, true, (s, e) => RestoreSelected());
             openButton.Dock = DockStyle.Top;
-            openButton.Margin = new Padding(18, 0, 18, 0);
+            openButton.Margin = new Padding(8, 0, 8, 0);
             actions.Controls.Add(openButton, 0, 0);
 
             var manageGroup = AddActionGroup(
@@ -1545,24 +3838,32 @@ namespace WindowLayoutLauncher
             actions.Controls.Add(manageGroup, 0, 2);
 
             var shareGroup = AddActionGroup(
-                new[] { "导出 JSON", "导入 JSON" },
-                new EventHandler[] { (s, e) => ExportSelected(), (s, e) => ImportLayout() });
+                new[] { "导出 JSON", "导入 JSON", "网页地址" },
+                new EventHandler[] { (s, e) => ExportSelected(), (s, e) => ImportLayout(), (s, e) => EditBrowserUrls() });
             shareGroup.Dock = DockStyle.Fill;
             shareGroup.Margin = new Padding(0);
             actions.Controls.Add(shareGroup, 0, 4);
 
             var fileGroup = AddActionGroup(
-                new[] { "布局文件夹", "日志与诊断", "刷新" },
-                new EventHandler[] { (s, e) => Process.Start("explorer.exe", manager.LayoutDir), (s, e) => ShowLogs(), (s, e) => RefreshLayouts() });
+                new[] { "打开布局文件夹", "刷新布局" },
+                new EventHandler[] { (s, e) => Process.Start("explorer.exe", manager.LayoutDir), (s, e) => RefreshLayouts() });
             fileGroup.Dock = DockStyle.Fill;
             fileGroup.Margin = new Padding(0);
             actions.Controls.Add(fileGroup, 0, 6);
 
             var aboutButton = AddButton(actions, "关于 / 检查更新", 0, 0, false, (s, e) => ShowAbout());
             aboutButton.Dock = DockStyle.Top;
-            aboutButton.Margin = new Padding(18, 0, 18, 0);
-            aboutButton.Height = 32;
+            aboutButton.Margin = new Padding(8, 0, 8, 0);
+            aboutButton.Height = 34;
             actions.Controls.Add(aboutButton, 0, 8);
+            actionScroll.HorizontalScroll.Enabled = false;
+            actionScroll.HorizontalScroll.Visible = false;
+            actionScroll.HorizontalScroll.Maximum = 0;
+            actionScroll.SizeChanged += (s, e) =>
+            {
+                actionScroll.HorizontalScroll.Maximum = 0;
+                actionScroll.HorizontalScroll.Visible = false;
+            };
 
             statusLabel = new Label();
             statusLabel.Dock = DockStyle.Fill;
@@ -1573,88 +3874,36 @@ namespace WindowLayoutLauncher
             root.Controls.Add(statusLabel, 0, 4);
 
             Shown += OnFirstShown;
+            KeyDown += (s, e) =>
+            {
+                if (e.Control && e.KeyCode == Keys.N)
+                {
+                    SaveNew();
+                    e.Handled = true;
+                    e.SuppressKeyPress = true;
+                }
+                else if (e.KeyCode == Keys.F5)
+                {
+                    RefreshLayouts();
+                    e.Handled = true;
+                }
+            };
         }
 
         private void OnFirstShown(object sender, EventArgs e)
         {
             Shown -= OnFirstShown;
-            BeginInvoke((Action)(() => AutoCheckUpdate()));
-        }
-
-        private void AutoCheckUpdate()
-        {
-            try
+            if (listBox.Items.Count == 0)
             {
-                var lastCheckPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "last_update_check.txt");
-                var shouldCheck = true;
-                if (File.Exists(lastCheckPath))
+                using (var wizard = new SetupWizardForm())
                 {
-                    try
+                    if (wizard.ShowDialog(this) == DialogResult.OK)
                     {
-                        var text = File.ReadAllText(lastCheckPath);
-                        DateTime lastTime;
-                        if (DateTime.TryParse(text, out lastTime))
-                        {
-                            if ((DateTime.Now - lastTime).TotalHours < 6)
-                            {
-                                shouldCheck = false;
-                            }
-                        }
+                        pendingTaskMode = wizard.TaskMode;
+                        hintLabel.Text = "先打开需要的窗口并摆好位置，然后保存为“" + pendingTaskMode + "”布局。";
+                        statusLabel.Text = "准备好了以后，点击“保存为新布局”。";
                     }
-                    catch { }
                 }
-
-                if (!shouldCheck) return;
-
-                AppLogger.Write("INFO", "update_check_started", "automatic");
-                ThreadPool.QueueUserWorkItem(_ =>
-                {
-                    string error;
-                    var info = UpdateChecker.CheckForUpdate(out error);
-                    try
-                    {
-                        File.WriteAllText(lastCheckPath, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
-                    }
-                    catch (Exception writeEx)
-                    {
-                        AppLogger.Write("WARN", "update_check_stamp_failed", writeEx.Message);
-                    }
-
-                    if (info == null)
-                    {
-                        AppLogger.Write("WARN", "update_check_failed", error ?? "unknown");
-                        return;
-                    }
-
-                    AppLogger.Write("INFO", "update_check_finished", "remote=" + info.Version);
-                    if (!UpdateChecker.IsNewerVersion(info.Version, Program.Version)) return;
-
-                    try
-                    {
-                        BeginInvoke((Action)(() =>
-                        {
-                            var result = MessageBox.Show(this,
-                                "发现新版本 v" + info.Version + "\n\n" +
-                                (info.ReleaseNotes ?? "暂无更新说明") + "\n\n" +
-                                "是否立即更新？",
-                                "发现新版本 - " + Program.AppName,
-                                MessageBoxButtons.YesNo,
-                                MessageBoxIcon.Information);
-
-                            if (result == DialogResult.Yes)
-                            {
-                                using (var about = new AboutForm()) about.ShowDialog(this);
-                            }
-                        }));
-                    }
-                    catch
-                    {
-                    }
-                });
-            }
-            catch (Exception ex)
-            {
-                AppLogger.Write("WARN", "update_check_schedule_failed", ex.Message);
             }
         }
 
@@ -1663,14 +3912,6 @@ namespace WindowLayoutLauncher
             using (var about = new AboutForm())
             {
                 about.ShowDialog(this);
-            }
-        }
-
-        private void ShowLogs()
-        {
-            using (var logs = new LogViewerForm(manager))
-            {
-                logs.ShowDialog(this);
             }
         }
 
@@ -1704,6 +3945,122 @@ namespace WindowLayoutLauncher
             }
         }
 
+        private void InitializeTray()
+        {
+            trayMenu = new ContextMenuStrip();
+            trayMenu.Font = new Font("Microsoft YaHei UI", 9F);
+            trayIcon = new NotifyIcon();
+            trayIcon.Text = "窗口布局启动器";
+            trayIcon.Icon = Icon ?? Icon.ExtractAssociatedIcon(Application.ExecutablePath);
+            trayIcon.ContextMenuStrip = trayMenu;
+            trayIcon.Visible = true;
+            trayIcon.DoubleClick += (s, e) => ShowMainWindow();
+            RebuildTrayMenu();
+        }
+
+        private void RebuildTrayMenu()
+        {
+            if (trayMenu == null) return;
+            trayMenu.Items.Clear();
+            trayMenu.Items.Add("打开窗口布局中心", null, (s, e) => ShowMainWindow());
+            trayMenu.Items.Add(new ToolStripSeparator());
+            var layouts = manager.GetLayouts();
+            foreach (var layout in layouts)
+            {
+                var captured = layout;
+                trayMenu.Items.Add("开始" + (string.IsNullOrWhiteSpace(captured.TaskMode) ? captured.Name : captured.TaskMode) + "  ·  " + captured.Name,
+                    null, (s, e) => RestoreLayout(captured));
+            }
+            if (layouts.Count == 0)
+            {
+                var empty = trayMenu.Items.Add("还没有保存布局");
+                empty.Enabled = false;
+            }
+            trayMenu.Items.Add(new ToolStripSeparator());
+            trayMenu.Items.Add("退出", null, (s, e) => { allowExit = true; Close(); });
+            TaskbarIntegration.UpdateJumpList(layouts);
+        }
+
+        private void ShowMainWindow()
+        {
+            ignoreMinimizeUntilUtc = DateTime.UtcNow.AddMilliseconds(1200);
+            ShowInTaskbar = true;
+            WindowState = FormWindowState.Normal;
+            Show();
+            BringToFront();
+            Activate();
+        }
+
+        private void HideToTray()
+        {
+            ShowInTaskbar = true;
+            WindowState = FormWindowState.Minimized;
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            const int WmSysCommand = 0x0112;
+            const int ScClose = 0xF060;
+            const int ScMinimize = 0xF020;
+            int systemCommand = m.Msg == WmSysCommand ? ((int)m.WParam & 0xFFF0) : 0;
+            if (!allowExit && systemCommand == ScClose)
+            {
+                HideToTray();
+                return;
+            }
+            if (systemCommand == ScMinimize && DateTime.UtcNow < ignoreMinimizeUntilUtc)
+            {
+                return;
+            }
+            if (m.Msg == Program.ShowMainWindowMessage)
+            {
+                BeginInvoke((Action)(() => ShowMainWindow()));
+            }
+            base.WndProc(ref m);
+        }
+
+        protected override void OnResize(EventArgs e)
+        {
+            base.OnResize(e);
+            if (WindowState == FormWindowState.Minimized)
+            {
+                HideToTray();
+            }
+        }
+
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            if (!allowExit && e.CloseReason != CloseReason.WindowsShutDown &&
+                e.CloseReason != CloseReason.TaskManagerClosing &&
+                e.CloseReason != CloseReason.ApplicationExitCall)
+            {
+                e.Cancel = true;
+                HideToTray();
+                return;
+            }
+            if (trayIcon != null) trayIcon.Visible = false;
+            base.OnFormClosing(e);
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                if (trayIcon != null)
+                {
+                    trayIcon.Visible = false;
+                    trayIcon.Dispose();
+                    trayIcon = null;
+                }
+                if (trayMenu != null)
+                {
+                    trayMenu.Dispose();
+                    trayMenu = null;
+                }
+            }
+            base.Dispose(disposing);
+        }
+
         protected override void OnPaintBackground(PaintEventArgs e)
         {
             using (var brush = new LinearGradientBrush(ClientRectangle, UiTheme.WindowTop, UiTheme.WindowBottom, 90F))
@@ -1711,14 +4068,6 @@ namespace WindowLayoutLauncher
                 e.Graphics.FillRectangle(brush, ClientRectangle);
             }
             e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-            using (var b1 = new SolidBrush(Color.FromArgb(34, 48, 126, 255)))
-            using (var b2 = new SolidBrush(Color.FromArgb(52, 255, 255, 255)))
-            using (var b3 = new SolidBrush(Color.FromArgb(24, 65, 213, 207)))
-            {
-                e.Graphics.FillEllipse(b1, new Rectangle(Width - 250, -110, 320, 260));
-                e.Graphics.FillEllipse(b2, new Rectangle(-130, Height - 220, 280, 260));
-                e.Graphics.FillEllipse(b3, new Rectangle(Width - 260, Height - 170, 180, 150));
-            }
         }
 
         private GlassButton AddButton(Control parent, string text, int left, int top, bool primary, EventHandler handler)
@@ -1751,17 +4100,24 @@ namespace WindowLayoutLauncher
             return button;
         }
 
-        private GlassPanel AddActionGroup(string[] labels, EventHandler[] handlers)
+        private Control AddActionGroup(string[] labels, EventHandler[] handlers)
         {
-            var group = new GlassPanel();
-            group.Width = 172;
-            group.Height = 20 + labels.Length * 36;
-            group.Radius = 18;
-            group.FillColor = UiTheme.Panel;
+            var group = new TableLayoutPanel();
+            group.BackColor = Color.Transparent;
+            group.ColumnCount = 1;
+            group.RowCount = labels.Length;
+            group.Margin = new Padding(0);
+            for (int i = 0; i < labels.Length; i++)
+            {
+                group.RowStyles.Add(new RowStyle(SizeType.Absolute, 36F));
+            }
 
             for (int i = 0; i < labels.Length; i++)
             {
-                AddButton(group, labels[i], 18, 10 + i * 36, false, handlers[i]);
+                var button = AddButton(group, labels[i], 0, 0, false, handlers[i]);
+                button.Dock = DockStyle.Fill;
+                button.Margin = new Padding(6, 2, 6, 2);
+                group.Controls.Add(button, 0, i);
             }
             return group;
         }
@@ -1805,13 +4161,71 @@ namespace WindowLayoutLauncher
             }
 
             var name = item == null ? listBox.Items[e.Index].ToString() : item.Name;
-            var meta = item == null ? "" : (item.Count + " 个窗口｜" + FormatSavedAt(item.SavedAt));
+            var browserPages = item == null || item.Items == null
+                ? 0
+                : item.Items.Where(x => string.Equals(x.Kind, "browser", StringComparison.OrdinalIgnoreCase)).Sum(x => Math.Max(1, x.UrlList.Count));
+            var meta = item == null
+                ? ""
+                : (item.Count + " 个窗口" + (browserPages > 0 ? "｜" + browserPages + " 个网页" : "") + "｜" + FormatSavedAt(item.SavedAt));
+            var mode = item == null ? "工作" : (string.IsNullOrWhiteSpace(item.TaskMode) ? "工作" : item.TaskMode);
             int textLeft = rect.Left + (selected ? 22 : 14);
+            int previewWidth = rect.Width >= 330 ? Math.Min(112, rect.Width / 3) : 0;
+            int textWidth = rect.Width - 30 - (previewWidth > 0 ? previewWidth + 12 : 0);
             using (var nameFont = new Font("Microsoft YaHei UI", 10F, FontStyle.Bold))
             using (var metaFont = new Font("Microsoft YaHei UI", 8.5F))
             {
-                TextRenderer.DrawText(e.Graphics, name, nameFont, new Rectangle(textLeft, rect.Top + 11, rect.Width - 30, 24), UiTheme.Ink, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
-                TextRenderer.DrawText(e.Graphics, meta, metaFont, new Rectangle(textLeft, rect.Top + 38, rect.Width - 30, 22), UiTheme.Muted, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
+                TextRenderer.DrawText(e.Graphics, name, nameFont, new Rectangle(textLeft, rect.Top + 13, textWidth, 24), UiTheme.Ink, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
+                TextRenderer.DrawText(e.Graphics, "开始" + mode, metaFont, new Rectangle(textLeft, rect.Top + 40, textWidth, 20), UiTheme.BlueDark, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
+                TextRenderer.DrawText(e.Graphics, meta, metaFont, new Rectangle(textLeft, rect.Top + 62, textWidth, 20), UiTheme.Muted, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
+            }
+            if (previewWidth > 0 && item != null)
+            {
+                DrawLayoutPreview(e.Graphics, item, new Rectangle(rect.Right - previewWidth - 12, rect.Top + 13, previewWidth, rect.Height - 26));
+            }
+        }
+
+        private void DrawLayoutPreview(Graphics g, LayoutSummary summary, Rectangle bounds)
+        {
+            using (var screenPath = UiTheme.RoundedRect(bounds, 8))
+            using (var screenBrush = new SolidBrush(Color.FromArgb(202, 215, 226)))
+            using (var screenPen = new Pen(Color.FromArgb(150, 166, 183, 198)))
+            {
+                g.FillPath(screenBrush, screenPath);
+                g.DrawPath(screenPen, screenPath);
+            }
+            var items = summary.Items ?? new List<LayoutItem>();
+            if (items.Count == 0) return;
+            int minX = items.Min(x => x.X);
+            int minY = items.Min(x => x.Y);
+            int maxX = items.Max(x => x.X + Math.Max(1, x.W));
+            int maxY = items.Max(x => x.Y + Math.Max(1, x.H));
+            double scaleX = (bounds.Width - 12) / (double)Math.Max(1, maxX - minX);
+            double scaleY = (bounds.Height - 12) / (double)Math.Max(1, maxY - minY);
+            double scale = Math.Min(scaleX, scaleY);
+            int usedW = (int)Math.Round((maxX - minX) * scale);
+            int usedH = (int)Math.Round((maxY - minY) * scale);
+            int offsetX = bounds.X + (bounds.Width - usedW) / 2;
+            int offsetY = bounds.Y + (bounds.Height - usedH) / 2;
+            for (int i = 0; i < items.Count; i++)
+            {
+                var item = items[i];
+                var r = new Rectangle(
+                    offsetX + (int)Math.Round((item.X - minX) * scale),
+                    offsetY + (int)Math.Round((item.Y - minY) * scale),
+                    Math.Max(4, (int)Math.Round(item.W * scale)),
+                    Math.Max(4, (int)Math.Round(item.H * scale)));
+                r.Intersect(new Rectangle(bounds.X + 4, bounds.Y + 4, bounds.Width - 8, bounds.Height - 8));
+                var fill = string.Equals(item.Kind, "explorer", StringComparison.OrdinalIgnoreCase)
+                    ? Color.FromArgb(119, 180, 255)
+                    : string.Equals(item.Kind, "browser", StringComparison.OrdinalIgnoreCase)
+                        ? Color.FromArgb(72, 205, 190)
+                        : Color.FromArgb(151, 164, 184);
+                using (var brush = new SolidBrush(fill))
+                using (var pen = new Pen(Color.FromArgb(180, 255, 255, 255)))
+                {
+                    g.FillRectangle(brush, r);
+                    g.DrawRectangle(pen, r);
+                }
             }
         }
 
@@ -1851,6 +4265,15 @@ namespace WindowLayoutLauncher
                 listBox.SelectedIndex = selectedIndex;
             }
             statusLabel.Text = listBox.Items.Count > 0 ? "已加载 " + listBox.Items.Count + " 个布局。" : "还没有布局。先摆好窗口，然后点“保存为新布局”。";
+            UpdateSelectedLayoutUi();
+            RebuildTrayMenu();
+        }
+
+        private void UpdateSelectedLayoutUi()
+        {
+            var selected = SelectedLayout();
+            if (openButton == null) return;
+            openButton.Text = selected == null ? "打开布局" : "开始" + (string.IsNullOrWhiteSpace(selected.TaskMode) ? "工作" : selected.TaskMode);
         }
 
         private LayoutSummary SelectedLayout()
@@ -1867,6 +4290,33 @@ namespace WindowLayoutLauncher
                 return;
             }
 
+            RestoreLayout(selected);
+        }
+
+        private void RestoreLayout(LayoutSummary selected)
+        {
+            if (selected == null) return;
+            var health = manager.CheckHealth(selected);
+            var visibleIssues = health.Issues
+                .Where(x => !string.Equals(x.Level, "info", StringComparison.OrdinalIgnoreCase))
+                .Select(x => "• " + x.Message)
+                .Distinct()
+                .ToList();
+            if (visibleIssues.Count > 0)
+            {
+                ShowMainWindow();
+                var answer = MessageBox.Show(this,
+                    "打开前发现以下情况：\n\n" + string.Join("\n", visibleIssues.ToArray()) + "\n\n仍然继续吗？",
+                    "布局健康检查",
+                    MessageBoxButtons.YesNo,
+                    health.HasBlockingIssues ? MessageBoxIcon.Warning : MessageBoxIcon.Information);
+                if (answer != DialogResult.Yes)
+                {
+                    statusLabel.Text = "已取消，先处理布局健康检查中的问题。";
+                    return;
+                }
+            }
+
             statusLabel.Text = "正在恢复：" + selected.Name;
             Refresh();
             var sw = Stopwatch.StartNew();
@@ -1875,29 +4325,8 @@ namespace WindowLayoutLauncher
 
             if (result.Failed > 0 && result.FailDetails != null && result.FailDetails.Count > 0)
             {
-                var detailText = string.Join(Environment.NewLine, result.FailDetails);
-                statusLabel.Text = result.Message + "，用时 " + sw.Elapsed.TotalSeconds.ToString("0.0") + " 秒。点击查看失败详情";
-
-                var logDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "logs");
-                if (Directory.Exists(logDir))
-                {
-                    try
-                    {
-                        var latestLog = Directory.GetFiles(logDir, "restore_*.log")
-                            .OrderByDescending(f => f)
-                            .FirstOrDefault();
-                        if (!string.IsNullOrEmpty(latestLog))
-                        {
-                            detailText += Environment.NewLine + Environment.NewLine + "详细日志: " + latestLog;
-                        }
-                    }
-                    catch { }
-                }
-
-                BeginInvoke((Action)(() =>
-                {
-                    MessageBox.Show(this, detailText, "恢复失败详情", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                }));
+                statusLabel.Text = result.Message + "，用时 " + sw.Elapsed.TotalSeconds.ToString("0.0") + " 秒。详情已写入日志。";
+                NotificationToastForm.ShowRestoreResult(result);
             }
             else
             {
@@ -1905,15 +4334,49 @@ namespace WindowLayoutLauncher
             }
         }
 
-        private void SaveNew()
+        private void EditBrowserUrls()
         {
-            var name = PromptForm.Ask("保存为新布局", "给这个布局起个名字：", "新布局");
+            var selected = SelectedLayout();
+            if (selected == null)
+            {
+                statusLabel.Text = "先选一个布局。";
+                return;
+            }
+
+            var layout = manager.GetLayout(selected);
+            var browserItems = (layout == null ? new List<LayoutItem>() : (layout.Items ?? new List<LayoutItem>()))
+                .Where(x => string.Equals(x.Kind, "browser", StringComparison.OrdinalIgnoreCase))
+                .ToList();
+            if (browserItems.Count == 0)
+            {
+                statusLabel.Text = "这个布局里没有浏览器窗口。";
+                return;
+            }
+
+            using (var form = new BrowserUrlsForm(browserItems))
+            {
+                if (form.ShowDialog(this) != DialogResult.OK)
+                {
+                    statusLabel.Text = "已取消。";
+                    return;
+                }
+            }
+
+            manager.SaveLayout(selected.Name, layout);
+            RefreshLayouts(selected.Name);
+            statusLabel.Text = "已更新网页地址：" + selected.Name + "（" + browserItems.Count + " 个浏览器窗口）。";
+        }
+
+        private void SaveNew()
+        {            var name = PromptForm.Ask("保存为新布局", "给这个布局起个名字：", "新布局");
             if (string.IsNullOrWhiteSpace(name))
             {
                 statusLabel.Text = "已取消。";
                 return;
             }
-            var layout = manager.SaveCurrent(name);
+            var taskMode = string.IsNullOrWhiteSpace(pendingTaskMode) ? LayoutManager.InferTaskMode(name) : pendingTaskMode;
+            var layout = manager.SaveCurrent(name, taskMode);
+            pendingTaskMode = null;
             RefreshLayouts(layout.Name);
             statusLabel.Text = "已保存：" + layout.Name + "（" + layout.Items.Count + " 个窗口）。";
         }
@@ -1926,7 +4389,7 @@ namespace WindowLayoutLauncher
                 statusLabel.Text = "先选一个要覆盖的布局。";
                 return;
             }
-            var layout = manager.SaveCurrent(selected.Name);
+            var layout = manager.SaveCurrent(selected.Name, selected.TaskMode);
             RefreshLayouts(layout.Name);
             statusLabel.Text = "已覆盖：" + layout.Name + "（" + layout.Items.Count + " 个窗口）。";
         }
@@ -2020,178 +4483,7 @@ namespace WindowLayoutLauncher
                 }
             }
         }
-    }
 
-    public class LogViewerForm : Form
-    {
-        private readonly LayoutManager manager;
-        private ListBox logList;
-        private RichTextBox contentBox;
-        private Label statusLabel;
-
-        public LogViewerForm(LayoutManager manager)
-        {
-            this.manager = manager;
-            Initialize();
-            RefreshLogs();
-        }
-
-        private void Initialize()
-        {
-            AutoScaleMode = AutoScaleMode.None;
-            Text = "日志与诊断 - " + Program.AppName;
-            StartPosition = FormStartPosition.CenterParent;
-            Size = UiTheme.DpiSize(820, 560);
-            MinimumSize = UiTheme.DpiSize(680, 420);
-            Font = new Font("Microsoft YaHei UI", 9F);
-            BackColor = UiTheme.WindowBottom;
-
-            var root = new TableLayoutPanel();
-            root.Dock = DockStyle.Fill;
-            root.Padding = new Padding(18);
-            root.BackColor = Color.Transparent;
-            root.ColumnCount = 2;
-            root.RowCount = 2;
-            root.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 260F));
-            root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
-            root.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
-            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 34F));
-            Controls.Add(root);
-
-            var left = new GlassPanel();
-            left.Dock = DockStyle.Fill;
-            left.Padding = new Padding(12);
-            left.FillColor = UiTheme.Panel;
-            root.Controls.Add(left, 0, 0);
-
-            var leftLayout = new TableLayoutPanel();
-            leftLayout.Dock = DockStyle.Fill;
-            leftLayout.BackColor = Color.Transparent;
-            leftLayout.RowCount = 2;
-            leftLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 28F));
-            leftLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
-            left.Controls.Add(leftLayout);
-
-            var leftTitle = new Label();
-            leftTitle.Text = "日志文件";
-            leftTitle.Dock = DockStyle.Fill;
-            leftTitle.Font = new Font("Microsoft YaHei UI", 10F, FontStyle.Bold);
-            leftTitle.ForeColor = UiTheme.Ink;
-            leftTitle.TextAlign = ContentAlignment.MiddleLeft;
-            leftTitle.BackColor = Color.Transparent;
-            leftLayout.Controls.Add(leftTitle, 0, 0);
-
-            logList = new ListBox();
-            logList.Dock = DockStyle.Fill;
-            logList.DisplayMember = "Display";
-            logList.BackColor = UiTheme.Panel;
-            logList.ForeColor = UiTheme.Ink;
-            logList.BorderStyle = BorderStyle.None;
-            logList.SelectedIndexChanged += (s, e) => LoadSelectedLog();
-            leftLayout.Controls.Add(logList, 0, 1);
-
-            var right = new GlassPanel();
-            right.Dock = DockStyle.Fill;
-            right.Padding = new Padding(12);
-            right.Margin = new Padding(12, 0, 0, 0);
-            right.FillColor = UiTheme.Panel;
-            root.Controls.Add(right, 1, 0);
-
-            contentBox = new RichTextBox();
-            contentBox.Dock = DockStyle.Fill;
-            contentBox.ReadOnly = true;
-            contentBox.WordWrap = false;
-            contentBox.Font = new Font("Consolas", 9F);
-            contentBox.BackColor = Color.FromArgb(248, 250, 252);
-            contentBox.ForeColor = UiTheme.Ink;
-            contentBox.BorderStyle = BorderStyle.None;
-            right.Controls.Add(contentBox);
-
-            var actions = new FlowLayoutPanel();
-            actions.Dock = DockStyle.Fill;
-            actions.BackColor = Color.Transparent;
-            actions.FlowDirection = FlowDirection.LeftToRight;
-            actions.WrapContents = false;
-            root.Controls.Add(actions, 0, 1);
-            root.SetColumnSpan(actions, 2);
-
-            var refreshButton = new GlassButton();
-            refreshButton.Text = "刷新日志";
-            refreshButton.Width = 100;
-            refreshButton.Height = 30;
-            refreshButton.Click += (s, e) => RefreshLogs();
-            actions.Controls.Add(refreshButton);
-
-            var folderButton = new GlassButton();
-            folderButton.Text = "打开日志文件夹";
-            folderButton.Width = 140;
-            folderButton.Height = 30;
-            folderButton.Click += (s, e) =>
-            {
-                try { Process.Start("explorer.exe", manager.LogsDir); }
-                catch (Exception ex) { statusLabel.Text = "打开文件夹失败：" + ex.Message; }
-            };
-            actions.Controls.Add(folderButton);
-
-            statusLabel = new Label();
-            statusLabel.AutoSize = true;
-            statusLabel.ForeColor = UiTheme.Muted;
-            statusLabel.BackColor = Color.Transparent;
-            statusLabel.Margin = new Padding(12, 8, 0, 0);
-            actions.Controls.Add(statusLabel);
-        }
-
-        private void RefreshLogs()
-        {
-            var selectedPath = (logList.SelectedItem as LogSummary == null) ? null : ((LogSummary)logList.SelectedItem).Path;
-            logList.Items.Clear();
-            try
-            {
-                foreach (var log in manager.GetLogs()) logList.Items.Add(log);
-                if (logList.Items.Count > 0)
-                {
-                    var selectedIndex = 0;
-                    for (int i = 0; i < logList.Items.Count; i++)
-                    {
-                        var item = logList.Items[i] as LogSummary;
-                        if (item != null && string.Equals(item.Path, selectedPath, StringComparison.OrdinalIgnoreCase))
-                        {
-                            selectedIndex = i;
-                            break;
-                        }
-                    }
-                    logList.SelectedIndex = selectedIndex;
-                }
-                else
-                {
-                    contentBox.Text = "暂无日志。完成一次恢复、检查更新或发生错误后，这里会显示诊断记录。";
-                }
-                statusLabel.Text = "共 " + logList.Items.Count + " 个日志文件";
-            }
-            catch (Exception ex)
-            {
-                contentBox.Text = ex.ToString();
-                statusLabel.Text = "读取日志列表失败";
-            }
-        }
-
-        private void LoadSelectedLog()
-        {
-            var selected = logList.SelectedItem as LogSummary;
-            if (selected == null) return;
-            try
-            {
-                contentBox.Text = manager.ReadLog(selected.Path);
-                contentBox.SelectionStart = 0;
-                contentBox.SelectionLength = 0;
-                statusLabel.Text = selected.Name + " · " + selected.Length + " 字节";
-            }
-            catch (Exception ex)
-            {
-                contentBox.Text = ex.ToString();
-                statusLabel.Text = "读取日志失败";
-            }
-        }
     }
 
     [DataContract]
@@ -2208,9 +4500,6 @@ namespace WindowLayoutLauncher
 
         [DataMember(Name = "published_at")]
         public string PublishedAt { get; set; }
-
-        [DataMember(Name = "sha256", EmitDefaultValue = false)]
-        public string Sha256 { get; set; }
     }
 
     public static class UpdateChecker
@@ -2220,12 +4509,17 @@ namespace WindowLayoutLauncher
             error = null;
             try
             {
-                var url = Program.VersionCheckUrl;
-                var request = (System.Net.HttpWebRequest)System.Net.HttpWebRequest.Create(url);
+                EnableModernTls();
+                var url = Program.VersionCheckUrl + "?t=" + DateTime.UtcNow.Ticks;
+                var request = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(url);
                 request.Timeout = 8000;
+                request.ReadWriteTimeout = 8000;
                 request.Method = "GET";
-                request.UserAgent = Program.AppName + "/" + Program.Version;
+                request.UserAgent = "WindowLayoutLauncher/" + Program.Version;
+                request.AutomaticDecompression = System.Net.DecompressionMethods.GZip | System.Net.DecompressionMethods.Deflate;
+                request.CachePolicy = new System.Net.Cache.RequestCachePolicy(System.Net.Cache.RequestCacheLevel.NoCacheNoStore);
                 request.Headers.Add("Cache-Control", "no-cache");
+                request.Headers.Add("Pragma", "no-cache");
 
                 using (var response = request.GetResponse())
                 using (var stream = response.GetResponseStream())
@@ -2245,11 +4539,6 @@ namespace WindowLayoutLauncher
                         if (info == null || string.IsNullOrWhiteSpace(info.Version))
                         {
                             error = "版本信息格式错误";
-                            return null;
-                        }
-                        if (string.IsNullOrWhiteSpace(info.DownloadUrl) || !IsTrustedDownloadUrl(info.DownloadUrl))
-                        {
-                            error = "更新地址不受信任或缺失";
                             return null;
                         }
                         return info;
@@ -2290,130 +4579,73 @@ namespace WindowLayoutLauncher
             var parts = cleaned.ToString().Split(new[] { '.' }, StringSplitOptions.RemoveEmptyEntries);
             if (parts.Length == 0) return null;
             var nums = new List<int>();
-            try
+            for (int i = 0; i < 4; i++)
             {
-                for (int i = 0; i < 4; i++)
-                {
-                    nums.Add(i < parts.Length ? int.Parse(parts[i]) : 0);
-                }
-            }
-            catch
-            {
-                return null;
+                nums.Add(i < parts.Length ? int.Parse(parts[i]) : 0);
             }
             return new Version(nums[0], nums[1], nums[2], nums[3]);
         }
 
         public static string DownloadUpdate(string url, string targetPath, Action<int> progressCallback)
         {
-            return DownloadUpdate(url, targetPath, progressCallback, null);
-        }
-
-        public static string DownloadUpdate(string url, string targetPath, Action<int> progressCallback, string expectedSha256)
-        {
-            string partialPath = targetPath + ".part";
             try
             {
-                if (!IsTrustedDownloadUrl(url)) return "更新地址不受信任";
-                var uri = new Uri(url);
-                var request = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(uri);
-                request.Method = "GET";
-                request.Timeout = 20000;
-                request.ReadWriteTimeout = 20000;
-                request.UserAgent = Program.AppName + "/" + Program.Version;
-                request.AllowAutoRedirect = true;
-
-                if (File.Exists(partialPath)) File.Delete(partialPath);
-                if (File.Exists(targetPath)) File.Delete(targetPath);
-
-                using (var response = (System.Net.HttpWebResponse)request.GetResponse())
-                using (var input = response.GetResponseStream())
-                using (var output = new FileStream(partialPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                EnableModernTls();
+                using (var client = new System.Net.WebClient())
                 {
-                    var buffer = new byte[64 * 1024];
-                    var total = response.ContentLength;
-                    long downloaded = 0;
-                    int lastPercent = -1;
-                    int read;
-                    while ((read = input.Read(buffer, 0, buffer.Length)) > 0)
+                    client.Headers[System.Net.HttpRequestHeader.UserAgent] = "WindowLayoutLauncher/" + Program.Version;
+                    var done = false;
+                    client.DownloadProgressChanged += (s, e) =>
                     {
-                        output.Write(buffer, 0, read);
-                        downloaded += read;
-                        var percent = total > 0 ? (int)Math.Min(99, downloaded * 100L / total) : 0;
-                        if (percent != lastPercent)
-                        {
-                            lastPercent = percent;
-                            if (progressCallback != null) progressCallback(percent);
-                        }
+                        if (progressCallback != null) progressCallback(e.ProgressPercentage);
+                    };
+                    client.DownloadFileCompleted += (s, e) =>
+                    {
+                        done = true;
+                    };
+                    client.DownloadFileAsync(new Uri(url), targetPath);
+                    while (!done)
+                    {
+                        Application.DoEvents();
+                        Thread.Sleep(50);
                     }
-                    output.Flush();
                 }
-
-                var validationError = ValidateDownloadedFile(partialPath, expectedSha256);
-                if (!string.IsNullOrEmpty(validationError)) return validationError;
-                File.Move(partialPath, targetPath);
-                if (progressCallback != null) progressCallback(100);
-                AppLogger.Write("INFO", "update_download_finished", targetPath);
-                return null;
+                if (File.Exists(targetPath) && new FileInfo(targetPath).Length > 0)
+                {
+                    return null;
+                }
+                return "下载文件为空";
             }
             catch (Exception ex)
             {
-                AppLogger.Write("ERROR", "update_download_failed", ex.Message);
                 return ex.Message;
             }
-            finally
-            {
-                try
-                {
-                    if (File.Exists(partialPath)) File.Delete(partialPath);
-                }
-                catch
-                {
-                }
-            }
+        }
+
+        private static void EnableModernTls()
+        {
+            const System.Net.SecurityProtocolType tls12 = (System.Net.SecurityProtocolType)3072;
+            System.Net.ServicePointManager.SecurityProtocol = System.Net.ServicePointManager.SecurityProtocol | tls12;
         }
 
         public static bool ApplyUpdate(string newExePath)
         {
             try
             {
-                var validationError = ValidateDownloadedFile(newExePath, null);
-                if (!string.IsNullOrEmpty(validationError)) return false;
                 var currentExe = Application.ExecutablePath;
                 var dir = Path.GetDirectoryName(currentExe);
-                var batPath = Path.Combine(Path.GetTempPath(), "WindowLayoutLauncher_Update_" + Guid.NewGuid().ToString("N") + ".cmd");
-                var backupDir = Path.Combine(dir, "backups");
-                Directory.CreateDirectory(backupDir);
-                var backupPath = Path.Combine(backupDir, "窗口布局启动器_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".exe");
-                var updateDir = Path.GetDirectoryName(newExePath);
+                var batPath = Path.Combine(dir, "update.bat");
+                var oldExeBackup = Path.Combine(dir, "窗口布局启动器_old.exe");
 
                 var sb = new StringBuilder();
                 sb.AppendLine("@echo off");
-                sb.AppendLine("setlocal EnableExtensions");
-                sb.AppendLine("set \"CURRENT=" + currentExe + "\"");
-                sb.AppendLine("set \"NEW=" + newExePath + "\"");
-                sb.AppendLine("set \"BACKUP=" + backupPath + "\"");
-                sb.AppendLine("set \"UPDATE_DIR=" + updateDir + "\"");
+                sb.AppendLine("echo 正在更新窗口布局启动器...");
                 sb.AppendLine("timeout /t 2 /nobreak >nul");
-                sb.AppendLine("if not exist \"%NEW%\" goto fail");
-                sb.AppendLine("if not exist \"%CURRENT%\" goto fail");
-                sb.AppendLine("copy /Y \"%CURRENT%\" \"%BACKUP%\" >nul");
-                sb.AppendLine("if errorlevel 1 goto fail");
-                sb.AppendLine("move /Y \"%NEW%\" \"%CURRENT%\" >nul");
-                sb.AppendLine("if errorlevel 1 goto rollback");
-                sb.AppendLine("start \"\" \"%CURRENT%\"");
-                sb.AppendLine("rmdir /s /q \"%UPDATE_DIR%\" >nul 2>nul");
-                sb.AppendLine("del \"%~f0\"");
-                sb.AppendLine("exit /b 0");
-                sb.AppendLine(":rollback");
-                sb.AppendLine("copy /Y \"%BACKUP%\" \"%CURRENT%\" >nul");
-                sb.AppendLine("start \"\" \"%CURRENT%\"");
-                sb.AppendLine("rmdir /s /q \"%UPDATE_DIR%\" >nul 2>nul");
-                sb.AppendLine("del \"%~f0\"");
-                sb.AppendLine("exit /b 1");
-                sb.AppendLine(":fail");
-                sb.AppendLine("start \"\" \"%CURRENT%\"");
-                sb.AppendLine("rmdir /s /q \"%UPDATE_DIR%\" >nul 2>nul");
+                sb.AppendLine("if exist \"" + oldExeBackup + "\" del \"" + oldExeBackup + "\"");
+                sb.AppendLine("ren \"" + currentExe + "\" \"" + Path.GetFileName(oldExeBackup) + "\"");
+                sb.AppendLine("move /Y \"" + newExePath + "\" \"" + currentExe + "\"");
+                sb.AppendLine("echo 更新完成，正在启动新版本...");
+                sb.AppendLine("start \"\" \"" + currentExe + "\"");
                 sb.AppendLine("del \"%~f0\"");
                 File.WriteAllText(batPath, sb.ToString(), Encoding.Default);
 
@@ -2425,49 +4657,126 @@ namespace WindowLayoutLauncher
                     CreateNoWindow = true
                 });
 
-                AppLogger.Write("INFO", "update_apply_scheduled", "backup=" + backupPath);
                 return true;
             }
-            catch (Exception ex)
+            catch
             {
-                AppLogger.Write("ERROR", "update_apply_failed", ex.Message);
                 return false;
             }
         }
+    }
 
-        private static bool IsTrustedDownloadUrl(string url)
+    public class NotificationToastForm : Form
+    {
+        private readonly System.Windows.Forms.Timer closeTimer;
+
+        public static NotificationToastForm ForRestoreResult(RestoreResult result)
         {
-            Uri uri;
-            if (!Uri.TryCreate(url, UriKind.Absolute, out uri)) return false;
-            return string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase) &&
-                string.Equals(uri.Host, "github.com", StringComparison.OrdinalIgnoreCase) &&
-                uri.AbsolutePath.StartsWith("/zwmopen/WindowLayoutLauncher/releases/download/", StringComparison.OrdinalIgnoreCase);
+            int ok = result == null ? 0 : result.Ok;
+            int failed = result == null ? 0 : result.Failed;
+            string message = "已恢复 " + ok + " 个窗口，" + failed + " 个未恢复\n详情已自动保存到日志";
+            return new NotificationToastForm("布局恢复完成", message);
         }
 
-        private static string ValidateDownloadedFile(string path, string expectedSha256)
+        public static void ShowRestoreResult(RestoreResult result)
         {
-            if (string.IsNullOrWhiteSpace(path) || !File.Exists(path)) return "下载文件不存在";
-            var fileInfo = new FileInfo(path);
-            if (fileInfo.Length < 2) return "下载文件为空";
+            var toast = ForRestoreResult(result);
+            toast.FormClosed += (s, e) => toast.Dispose();
+            toast.Show();
+        }
 
-            using (var stream = File.OpenRead(path))
-            {
-                if (stream.ReadByte() != 'M' || stream.ReadByte() != 'Z') return "下载文件不是有效的 Windows 程序";
-            }
+        private NotificationToastForm(string title, string message)
+        {
+            AutoScaleMode = AutoScaleMode.None;
+            FormBorderStyle = FormBorderStyle.None;
+            StartPosition = FormStartPosition.Manual;
+            ClientSize = new Size(420, 108);
+            ShowInTaskbar = false;
+            TopMost = true;
+            BackColor = UiTheme.PanelLight;
+            Opacity = 0.97;
+            Font = new Font("Microsoft YaHei UI", 9F);
 
-            if (!string.IsNullOrWhiteSpace(expectedSha256))
+            var accent = new Panel
             {
-                using (var sha = SHA256.Create())
-                using (var stream = File.OpenRead(path))
-                {
-                    var actual = BitConverter.ToString(sha.ComputeHash(stream)).Replace("-", "").ToLowerInvariant();
-                    if (!string.Equals(actual, expectedSha256.Trim().ToLowerInvariant(), StringComparison.OrdinalIgnoreCase))
-                    {
-                        return "更新文件校验失败";
-                    }
-                }
+                Dock = DockStyle.Left,
+                Width = 5,
+                BackColor = UiTheme.Amber
+            };
+            Controls.Add(accent);
+
+            var titleLabel = new Label
+            {
+                Text = title,
+                Left = 26,
+                Top = 18,
+                Width = 365,
+                Height = 25,
+                Font = new Font("Microsoft YaHei UI", 10F, FontStyle.Bold),
+                ForeColor = UiTheme.Ink,
+                BackColor = Color.Transparent
+            };
+            Controls.Add(titleLabel);
+
+            var messageLabel = new Label
+            {
+                Text = message,
+                Left = 26,
+                Top = 48,
+                Width = 365,
+                Height = 45,
+                Font = new Font("Microsoft YaHei UI", 9F),
+                ForeColor = UiTheme.Muted,
+                BackColor = Color.Transparent
+            };
+            Controls.Add(messageLabel);
+
+            closeTimer = new System.Windows.Forms.Timer { Interval = 2100 };
+            closeTimer.Tick += (s, e) =>
+            {
+                closeTimer.Stop();
+                Close();
+            };
+        }
+
+        protected override bool ShowWithoutActivation
+        {
+            get { return true; }
+        }
+
+        protected override CreateParams CreateParams
+        {
+            get
+            {
+                const int WsExToolWindow = 0x00000080;
+                const int WsExNoActivate = 0x08000000;
+                var parameters = base.CreateParams;
+                parameters.ExStyle |= WsExToolWindow | WsExNoActivate;
+                return parameters;
             }
-            return null;
+        }
+
+        protected override void OnShown(EventArgs e)
+        {
+            base.OnShown(e);
+            var area = Screen.FromPoint(Cursor.Position).WorkingArea;
+            Location = new Point(
+                area.Left + Math.Max(0, (area.Width - Width) / 2),
+                area.Top + Math.Max(0, (area.Height - Height) / 2));
+            using (var path = UiTheme.RoundedRect(new Rectangle(0, 0, Width, Height), 12))
+            {
+                Region = new Region(path);
+            }
+            closeTimer.Start();
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing && closeTimer != null)
+            {
+                closeTimer.Dispose();
+            }
+            base.Dispose(disposing);
         }
     }
 
@@ -2476,7 +4785,6 @@ namespace WindowLayoutLauncher
         private Label titleLabel;
         private Label versionLabel;
         private Label descLabel;
-        private LinkLabel repoLink;
         private GlassButton checkUpdateButton;
         private GlassButton closeButton;
         private Label updateStatusLabel;
@@ -2486,99 +4794,141 @@ namespace WindowLayoutLauncher
             AutoScaleMode = AutoScaleMode.None;
             Text = "关于 " + Program.AppName;
             StartPosition = FormStartPosition.CenterParent;
-            Size = UiTheme.DpiSize(480, 360);
+            ClientSize = new Size(620, 470);
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false;
             MinimizeBox = false;
             Font = new Font("Microsoft YaHei UI", 9F);
             BackColor = UiTheme.WindowTop;
 
-            titleLabel = new Label();
-            titleLabel.Text = Program.AppName;
-            titleLabel.Font = new Font("Microsoft YaHei UI", 16F, FontStyle.Bold);
-            titleLabel.ForeColor = UiTheme.Ink;
-            titleLabel.BackColor = Color.Transparent;
-            titleLabel.AutoSize = true;
-            titleLabel.Left = 30;
-            titleLabel.Top = 25;
-            Controls.Add(titleLabel);
+            var root = new TableLayoutPanel();
+            root.Dock = DockStyle.Fill;
+            root.Padding = new Padding(34, 26, 34, 24);
+            root.ColumnCount = 1;
+            root.RowCount = 10;
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 40F));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 26F));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 60F));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 26F));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 60F));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 26F));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 82F));
+            root.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 30F));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 42F));
+            Controls.Add(root);
 
-            versionLabel = new Label();
-            versionLabel.Text = "版本 v" + Program.Version;
-            versionLabel.Font = new Font("Microsoft YaHei UI", 10F);
-            versionLabel.ForeColor = UiTheme.Muted;
-            versionLabel.BackColor = Color.Transparent;
-            versionLabel.AutoSize = true;
-            versionLabel.Left = 32;
-            versionLabel.Top = 60;
-            Controls.Add(versionLabel);
-
-            descLabel = new Label();
-            descLabel.Text = "保存不同工作流的窗口位置和大小，下次一键恢复。\n支持文件资源管理器、浏览器和普通应用窗口。";
-            descLabel.Font = new Font("Microsoft YaHei UI", 9.5F);
-            descLabel.ForeColor = UiTheme.Ink;
-            descLabel.BackColor = Color.Transparent;
-            descLabel.Left = 32;
-            descLabel.Top = 95;
-            descLabel.Width = 400;
-            descLabel.Height = 60;
-            Controls.Add(descLabel);
-
-            repoLink = new LinkLabel();
-            repoLink.Text = "开源地址：" + Program.RepoUrl;
-            repoLink.Font = new Font("Microsoft YaHei UI", 9F);
-            repoLink.ForeColor = UiTheme.Blue;
-            repoLink.LinkColor = UiTheme.Blue;
-            repoLink.BackColor = Color.Transparent;
-            repoLink.Left = 32;
-            repoLink.Top = 160;
-            repoLink.Width = 400;
-            repoLink.AutoSize = true;
-            repoLink.LinkClicked += (s, e) =>
+            titleLabel = new Label
             {
-                try { Process.Start(Program.RepoUrl); }
-                catch { }
+                Text = Program.AppName,
+                Dock = DockStyle.Fill,
+                Font = new Font("Microsoft YaHei UI", 16F, FontStyle.Bold),
+                ForeColor = UiTheme.Ink,
+                BackColor = Color.Transparent,
+                TextAlign = ContentAlignment.MiddleLeft
             };
-            Controls.Add(repoLink);
+            root.Controls.Add(titleLabel, 0, 0);
 
-            updateStatusLabel = new Label();
-            updateStatusLabel.Text = "";
-            updateStatusLabel.Font = new Font("Microsoft YaHei UI", 9F);
-            updateStatusLabel.ForeColor = UiTheme.Muted;
-            updateStatusLabel.BackColor = Color.Transparent;
-            updateStatusLabel.Left = 32;
-            updateStatusLabel.Top = 195;
-            updateStatusLabel.Width = 400;
-            updateStatusLabel.Height = 25;
-            updateStatusLabel.AutoSize = false;
-            Controls.Add(updateStatusLabel);
+            versionLabel = new Label
+            {
+                Text = "版本 v" + Program.Version + "  ·  Windows 桌面工作启动器",
+                Dock = DockStyle.Fill,
+                Font = new Font("Microsoft YaHei UI", 9.5F),
+                ForeColor = UiTheme.Muted,
+                BackColor = Color.Transparent,
+                TextAlign = ContentAlignment.MiddleLeft
+            };
+            root.Controls.Add(versionLabel, 0, 1);
 
-            checkUpdateButton = new GlassButton();
-            checkUpdateButton.Text = "检查更新";
-            checkUpdateButton.Left = 30;
-            checkUpdateButton.Top = 235;
-            checkUpdateButton.Width = 110;
-            checkUpdateButton.Height = 36;
-            checkUpdateButton.Primary = false;
-            checkUpdateButton.SurfaceColor = UiTheme.WindowTop;
-            checkUpdateButton.BackColor = UiTheme.WindowTop;
+            descLabel = new Label
+            {
+                Text = "把一组文件夹、网页和软件窗口保存成工作布局。下次开始工作时，直接恢复已经打开的窗口，并把它们放回对应屏幕和位置。",
+                Dock = DockStyle.Fill,
+                Font = new Font("Microsoft YaHei UI", 9.5F),
+                ForeColor = UiTheme.Ink,
+                BackColor = Color.Transparent,
+                TextAlign = ContentAlignment.MiddleLeft
+            };
+            root.Controls.Add(descLabel, 0, 2);
+
+            root.Controls.Add(SectionLabel("设计思路"), 0, 3);
+            root.Controls.Add(BodyLabel("少开窗口、少找入口、尽量复用已经打开的内容。布局只记录窗口位置和启动规则，不上传个人文件；主界面、任务栏和托盘共用同一套布局。"), 0, 4);
+            root.Controls.Add(SectionLabel("怎么使用"), 0, 5);
+            root.Controls.Add(BodyLabel("1. 打开工作需要的文件夹、网页和软件，摆好位置。\n2. 回到主界面，选择“保存为新布局”。\n3. 以后从主界面、任务栏右键或托盘菜单直接开始工作。"), 0, 6);
+
+            updateStatusLabel = new Label
+            {
+                Text = "更新由你主动检查，程序启动时不会打扰你。",
+                Dock = DockStyle.Fill,
+                Font = new Font("Microsoft YaHei UI", 9F),
+                ForeColor = UiTheme.Muted,
+                BackColor = Color.Transparent,
+                TextAlign = ContentAlignment.MiddleLeft
+            };
+            root.Controls.Add(updateStatusLabel, 0, 8);
+
+            var buttons = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 3,
+                RowCount = 1,
+                BackColor = Color.Transparent
+            };
+            buttons.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 120F));
+            buttons.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            buttons.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 90F));
+            root.Controls.Add(buttons, 0, 9);
+
+            checkUpdateButton = new GlassButton
+            {
+                Text = "检查更新",
+                Dock = DockStyle.Fill,
+                Primary = false,
+                SurfaceColor = UiTheme.WindowTop,
+                BackColor = UiTheme.WindowTop
+            };
             checkUpdateButton.Click += CheckUpdateButton_Click;
-            Controls.Add(checkUpdateButton);
+            buttons.Controls.Add(checkUpdateButton, 0, 0);
 
-            closeButton = new GlassButton();
-            closeButton.Text = "关闭";
-            closeButton.Left = 340;
-            closeButton.Top = 235;
-            closeButton.Width = 90;
-            closeButton.Height = 36;
-            closeButton.Primary = true;
-            closeButton.SurfaceColor = UiTheme.WindowTop;
-            closeButton.BackColor = UiTheme.WindowTop;
-            closeButton.DialogResult = DialogResult.OK;
-            Controls.Add(closeButton);
+            closeButton = new GlassButton
+            {
+                Text = "关闭",
+                Dock = DockStyle.Fill,
+                Primary = true,
+                SurfaceColor = UiTheme.WindowTop,
+                BackColor = UiTheme.WindowTop,
+                DialogResult = DialogResult.OK
+            };
+            buttons.Controls.Add(closeButton, 2, 0);
 
             AcceptButton = closeButton;
             CancelButton = closeButton;
+        }
+
+        private static Label SectionLabel(string text)
+        {
+            return new Label
+            {
+                Text = text,
+                Dock = DockStyle.Fill,
+                Font = new Font("Microsoft YaHei UI", 10F, FontStyle.Bold),
+                ForeColor = UiTheme.Ink,
+                BackColor = Color.Transparent,
+                TextAlign = ContentAlignment.BottomLeft
+            };
+        }
+
+        private static Label BodyLabel(string text)
+        {
+            return new Label
+            {
+                Text = text,
+                Dock = DockStyle.Fill,
+                Font = new Font("Microsoft YaHei UI", 9.3F),
+                ForeColor = UiTheme.Muted,
+                BackColor = Color.Transparent,
+                TextAlign = ContentAlignment.TopLeft
+            };
         }
 
         private void CheckUpdateButton_Click(object sender, EventArgs e)
@@ -2588,55 +4938,47 @@ namespace WindowLayoutLauncher
             updateStatusLabel.ForeColor = UiTheme.Muted;
             Refresh();
 
-            AppLogger.Write("INFO", "update_check_started", "manual");
-            ThreadPool.QueueUserWorkItem(_ =>
-            {
-                string error;
-                var info = UpdateChecker.CheckForUpdate(out error);
-                try
-                {
-                    BeginInvoke((Action)(() =>
-                    {
-                        if (info == null)
-                        {
-                            updateStatusLabel.Text = "检查失败：" + (error ?? "未知错误");
-                            updateStatusLabel.ForeColor = Color.FromArgb(220, 80, 80);
-                        }
-                        else if (UpdateChecker.IsNewerVersion(info.Version, Program.Version))
-                        {
-                            updateStatusLabel.Text = "发现新版本 v" + info.Version;
-                            updateStatusLabel.ForeColor = UiTheme.Blue;
-                            var result = MessageBox.Show(this,
-                                "发现新版本 v" + info.Version + "\n\n" +
-                                (info.ReleaseNotes ?? "暂无更新说明") + "\n\n" +
-                                "是否立即更新？",
-                                "发现新版本",
-                                MessageBoxButtons.YesNo,
-                                MessageBoxIcon.Information);
+            string error;
+            var info = UpdateChecker.CheckForUpdate(out error);
 
-                            if (result == DialogResult.Yes) DoUpdate(info);
-                        }
-                        else
-                        {
-                            updateStatusLabel.Text = "当前已是最新版本";
-                            updateStatusLabel.ForeColor = Color.FromArgb(60, 160, 100);
-                        }
-                        checkUpdateButton.Enabled = true;
-                    }));
-                }
-                catch
+            if (info == null)
+            {
+                updateStatusLabel.Text = "检查失败：" + (error ?? "未知错误");
+                updateStatusLabel.ForeColor = Color.FromArgb(220, 80, 80);
+                checkUpdateButton.Enabled = true;
+                return;
+            }
+
+            if (UpdateChecker.IsNewerVersion(info.Version, Program.Version))
+            {
+                updateStatusLabel.Text = "发现新版本 v" + info.Version;
+                updateStatusLabel.ForeColor = UiTheme.Blue;
+                using (var prompt = new UpdatePromptForm(info))
                 {
+                    if (prompt.ShowDialog(this) == DialogResult.OK)
+                    {
+                        DoUpdate(info);
+                    }
+                    else
+                    {
+                        updateStatusLabel.Text = "已跳过版本 v" + info.Version;
+                        updateStatusLabel.ForeColor = UiTheme.Muted;
+                    }
                 }
-                AppLogger.Write(info == null ? "WARN" : "INFO", "update_check_finished", info == null ? (error ?? "unknown") : "remote=" + info.Version);
-            });
+            }
+            else
+            {
+                updateStatusLabel.Text = "当前已是最新版本";
+                updateStatusLabel.ForeColor = Color.FromArgb(60, 160, 100);
+            }
+            checkUpdateButton.Enabled = true;
         }
 
         private void DoUpdate(VersionInfo info)
         {
-            var tempDir = Path.Combine(Path.GetTempPath(), "WindowLayoutLauncher_Update", Guid.NewGuid().ToString("N"));
+            var tempDir = Path.Combine(Path.GetTempPath(), "WLL_Update");
             Directory.CreateDirectory(tempDir);
-            var newExe = Path.Combine(tempDir, "窗口布局启动器.download.exe");
-            AppLogger.Write("INFO", "update_download_started", "version=" + info.Version);
+            var newExe = Path.Combine(tempDir, "窗口布局启动器_new.exe");
 
             var progressForm = new Form();
             progressForm.Text = "正在下载更新";
@@ -2645,7 +4987,6 @@ namespace WindowLayoutLauncher
             progressForm.FormBorderStyle = FormBorderStyle.FixedDialog;
             progressForm.MaximizeBox = false;
             progressForm.MinimizeBox = false;
-            progressForm.ControlBox = false;
             progressForm.BackColor = UiTheme.WindowTop;
             progressForm.Font = new Font("Microsoft YaHei UI", 9F);
 
@@ -2668,58 +5009,187 @@ namespace WindowLayoutLauncher
 
             progressForm.Shown += (s, e) =>
             {
-                ThreadPool.QueueUserWorkItem(_ =>
+                var error = UpdateChecker.DownloadUpdate(info.DownloadUrl, newExe, p =>
                 {
-                    var error = UpdateChecker.DownloadUpdate(info.DownloadUrl, newExe, p =>
-                    {
-                        try
-                        {
-                            progressForm.BeginInvoke((Action)(() =>
-                            {
-                                progressBar.Value = Math.Max(0, Math.Min(100, p));
-                                progressLabel.Text = "正在下载... " + p + "%";
-                            }));
-                        }
-                        catch { }
-                    }, info.Sha256);
-
                     try
                     {
-                        progressForm.BeginInvoke((Action)(() =>
-                        {
-                            progressForm.DialogResult = string.IsNullOrEmpty(error) ? DialogResult.OK : DialogResult.Abort;
-                            progressForm.Close();
-                        }));
+                        progressBar.Value = Math.Max(0, Math.Min(100, p));
+                        progressLabel.Text = "正在下载... " + p + "%";
                     }
                     catch { }
                 });
+
+                progressForm.DialogResult = string.IsNullOrEmpty(error) ? DialogResult.OK : DialogResult.Abort;
+                progressForm.Close();
             };
 
             var result = progressForm.ShowDialog(this);
             if (result != DialogResult.OK)
             {
-                updateStatusLabel.Text = "下载失败，详情已写入日志";
+                updateStatusLabel.Text = "下载失败";
                 updateStatusLabel.ForeColor = Color.FromArgb(220, 80, 80);
                 return;
             }
 
-            var confirm = MessageBox.Show(this,
-                "下载完成，是否立即安装更新？\n（安装时会自动关闭当前程序）",
-                "更新下载完成",
-                MessageBoxButtons.YesNo,
-                MessageBoxIcon.Question);
-
-            if (confirm == DialogResult.Yes)
+            if (UpdateChecker.ApplyUpdate(newExe))
             {
-                if (UpdateChecker.ApplyUpdate(newExe))
-                {
-                    Application.Exit();
-                }
-                else
-                {
-                    MessageBox.Show(this, "更新失败，请查看日志后重试。", "更新失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                }
+                Application.Exit();
             }
+            else
+            {
+                MessageBox.Show(this, "更新失败，请稍后重试。", "更新失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+    }
+
+    public class UpdatePromptForm : Form
+    {
+        public UpdatePromptForm(VersionInfo info)
+        {
+            AutoScaleMode = AutoScaleMode.None;
+            Text = "发现新版本";
+            StartPosition = FormStartPosition.CenterParent;
+            ClientSize = new Size(480, 260);
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            ShowInTaskbar = false;
+            Font = new Font("Microsoft YaHei UI", 9F);
+            BackColor = UiTheme.WindowTop;
+
+            var root = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                Padding = new Padding(28, 24, 28, 22),
+                ColumnCount = 1,
+                RowCount = 4,
+                BackColor = Color.Transparent
+            };
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 42F));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 32F));
+            root.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 40F));
+            Controls.Add(root);
+
+            root.Controls.Add(new Label
+            {
+                Text = "发现新版本 v" + (info == null ? "" : info.Version),
+                Dock = DockStyle.Fill,
+                Font = new Font("Microsoft YaHei UI", 14F, FontStyle.Bold),
+                ForeColor = UiTheme.Ink,
+                BackColor = Color.Transparent,
+                TextAlign = ContentAlignment.MiddleLeft
+            }, 0, 0);
+
+            root.Controls.Add(new Label
+            {
+                Text = "本次更新内容",
+                Dock = DockStyle.Fill,
+                Font = new Font("Microsoft YaHei UI", 9.5F, FontStyle.Bold),
+                ForeColor = UiTheme.Muted,
+                BackColor = Color.Transparent,
+                TextAlign = ContentAlignment.BottomLeft
+            }, 0, 1);
+
+            root.Controls.Add(new Label
+            {
+                Text = info == null || string.IsNullOrWhiteSpace(info.ReleaseNotes) ? "体验优化与问题修复。" : info.ReleaseNotes,
+                Dock = DockStyle.Fill,
+                Font = new Font("Microsoft YaHei UI", 9.3F),
+                ForeColor = UiTheme.Ink,
+                BackColor = Color.Transparent,
+                TextAlign = ContentAlignment.TopLeft
+            }, 0, 2);
+
+            var buttons = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                FlowDirection = FlowDirection.RightToLeft,
+                WrapContents = false,
+                BackColor = Color.Transparent
+            };
+            var update = new GlassButton
+            {
+                Text = "立刻更新",
+                Width = 105,
+                Height = 36,
+                Primary = true,
+                SurfaceColor = UiTheme.WindowTop,
+                BackColor = UiTheme.WindowTop,
+                DialogResult = DialogResult.OK
+            };
+            var skip = new GlassButton
+            {
+                Text = "跳过本次版本",
+                Width = 130,
+                Height = 36,
+                Primary = false,
+                SurfaceColor = UiTheme.WindowTop,
+                BackColor = UiTheme.WindowTop,
+                DialogResult = DialogResult.Cancel
+            };
+            buttons.Controls.Add(update);
+            buttons.Controls.Add(skip);
+            root.Controls.Add(buttons, 0, 3);
+
+            AcceptButton = update;
+            CancelButton = skip;
+        }
+    }
+
+    public class SetupWizardForm : Form
+    {
+        private ComboBox modeBox;
+        public string TaskMode { get { return Convert.ToString(modeBox.SelectedItem); } }
+
+        public SetupWizardForm()
+        {
+            AutoScaleMode = AutoScaleMode.None;
+            Text = "第一次使用";
+            StartPosition = FormStartPosition.CenterParent;
+            ClientSize = new Size(500, 310);
+            MinimumSize = new Size(460, 290);
+            Font = new Font("Microsoft YaHei UI", 9F);
+            BackColor = UiTheme.WindowTop;
+
+            var root = new TableLayoutPanel();
+            root.Dock = DockStyle.Fill;
+            root.Padding = new Padding(34, 28, 34, 24);
+            root.ColumnCount = 1;
+            root.RowCount = 6;
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 42F));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 52F));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 28F));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 42F));
+            root.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 42F));
+            Controls.Add(root);
+
+            var title = new Label { Text = "你要创建哪种工作布局？", Dock = DockStyle.Fill, Font = new Font("Microsoft YaHei UI", 14F, FontStyle.Bold), ForeColor = UiTheme.Ink };
+            root.Controls.Add(title, 0, 0);
+            var guide = new Label { Text = "选择工作类型后，打开需要的文件夹、网页和软件，把窗口摆好，再回到这里保存。", Dock = DockStyle.Fill, ForeColor = UiTheme.Muted };
+            root.Controls.Add(guide, 0, 1);
+            var label = new Label { Text = "工作类型", Dock = DockStyle.Fill, ForeColor = UiTheme.Ink, TextAlign = ContentAlignment.BottomLeft };
+            root.Controls.Add(label, 0, 2);
+
+            modeBox = new ComboBox();
+            modeBox.Dock = DockStyle.Top;
+            modeBox.DropDownStyle = ComboBoxStyle.DropDownList;
+            modeBox.Items.AddRange(new object[] { "素材处理", "GPT 双开", "剪辑", "写小红书", "运营", "客服工作", "做团建方案", "其他工作" });
+            modeBox.SelectedIndex = 0;
+            root.Controls.Add(modeBox, 0, 3);
+
+            var tip = new Label { Text = "这一步不会替你打开固定软件，只负责确定这套布局以后显示成“开始什么工作”。", Dock = DockStyle.Fill, ForeColor = UiTheme.Muted, TextAlign = ContentAlignment.TopLeft };
+            root.Controls.Add(tip, 0, 4);
+
+            var buttons = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.RightToLeft, WrapContents = false };
+            var ok = new GlassButton { Text = "开始准备", Width = 110, Height = 36, Primary = true, SurfaceColor = UiTheme.WindowTop, BackColor = UiTheme.WindowTop, DialogResult = DialogResult.OK };
+            var cancel = new GlassButton { Text = "稍后再说", Width = 100, Height = 36, SurfaceColor = UiTheme.WindowTop, BackColor = UiTheme.WindowTop, DialogResult = DialogResult.Cancel };
+            buttons.Controls.Add(ok);
+            buttons.Controls.Add(cancel);
+            root.Controls.Add(buttons, 0, 5);
+            AcceptButton = ok;
+            CancelButton = cancel;
         }
     }
 
@@ -2795,4 +5265,118 @@ namespace WindowLayoutLauncher
             Shown += (s, e) => { textBox.SelectAll(); textBox.Focus(); };
         }
     }
+
+    /// <summary>编辑布局里每个浏览器窗口保存的网址（一行一个）。</summary>
+    public class BrowserUrlsForm : Form
+    {
+        private readonly List<LayoutItem> items;
+        private readonly List<TextBox> boxes = new List<TextBox>();
+
+        public BrowserUrlsForm(List<LayoutItem> browserItems)
+        {
+            items = browserItems ?? new List<LayoutItem>();
+
+            AutoScaleMode = AutoScaleMode.None;
+            Text = "网页地址";
+            StartPosition = FormStartPosition.CenterParent;
+            ClientSize = new Size(700, 610);
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            Font = new Font("Microsoft YaHei UI", 9F);
+            BackColor = UiTheme.WindowTop;
+
+            var header = new Label();
+            header.Text = "每个浏览器配置可以保存多个网址：一行一个，恢复布局时按顺序在这个配置里打开。";
+            header.SetBounds(24, 16, ClientSize.Width - 48, 24);
+            header.ForeColor = UiTheme.Muted;
+            header.BackColor = Color.Transparent;
+            Controls.Add(header);
+
+            var hint = new Label();
+            hint.Text = "留空则只打开这个配置的窗口，不指定网页。";
+            hint.SetBounds(24, 40, ClientSize.Width - 48, 22);
+            hint.ForeColor = UiTheme.Muted;
+            hint.BackColor = Color.Transparent;
+            Controls.Add(hint);
+
+            var scroll = new Panel();
+            scroll.SetBounds(20, 70, ClientSize.Width - 40, ClientSize.Height - 148);
+            scroll.AutoScroll = true;
+            scroll.BackColor = UiTheme.PanelLight;
+            Controls.Add(scroll);
+
+            int top = 12;
+            int boxWidth = scroll.Width - 46;
+            foreach (var item in items)
+            {
+                var title = new Label();
+                title.Text = BrowserProbe.FamilyLabel(item.Browser) + "  ·  " + Caption(item);
+                title.SetBounds(14, top, boxWidth, 22);
+                title.ForeColor = UiTheme.Ink;
+                title.BackColor = Color.Transparent;
+                title.Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold);
+                scroll.Controls.Add(title);
+
+                var box = new TextBox();
+                box.Multiline = true;
+                box.ScrollBars = ScrollBars.Vertical;
+                box.BorderStyle = BorderStyle.FixedSingle;
+                box.SetBounds(14, top + 26, boxWidth, 84);
+                box.Text = string.Join("\r\n", item.UrlList.ToArray());
+                scroll.Controls.Add(box);
+                boxes.Add(box);
+
+                top += 126;
+            }
+
+            var ok = new GlassButton();
+            ok.Text = "保存";
+            ok.SetBounds(ClientSize.Width - 208, ClientSize.Height - 58, 84, 34);
+            ok.Primary = true;
+            ok.SurfaceColor = UiTheme.WindowTop;
+            ok.BackColor = UiTheme.WindowTop;
+            ok.Click += (s, e) =>
+            {
+                Apply();
+                DialogResult = DialogResult.OK;
+                Close();
+            };
+            Controls.Add(ok);
+
+            var cancel = new GlassButton();
+            cancel.Text = "取消";
+            cancel.SetBounds(ClientSize.Width - 112, ClientSize.Height - 58, 84, 34);
+            cancel.SurfaceColor = UiTheme.WindowTop;
+            cancel.BackColor = UiTheme.WindowTop;
+            cancel.DialogResult = DialogResult.Cancel;
+            Controls.Add(cancel);
+
+            AcceptButton = ok;
+            CancelButton = cancel;
+        }
+
+        private static string Caption(LayoutItem item)
+        {
+            if (!string.IsNullOrWhiteSpace(item.ProfileName)) return item.ProfileName;
+            if (!string.IsNullOrWhiteSpace(item.Profile)) return item.Profile;
+            return string.IsNullOrWhiteSpace(item.Title) ? "未识别配置" : item.Title;
+        }
+
+        private void Apply()
+        {
+            for (int i = 0; i < items.Count && i < boxes.Count; i++)
+            {
+                var urls = boxes[i].Text
+                    .Replace("\r\n", "\n")
+                    .Split('\n')
+                    .Select(x => x.Trim())
+                    .Where(x => x.Length > 0)
+                    .ToList();
+                items[i].Urls = urls;
+                items[i].Url = urls.Count > 0 ? urls[0] : null;
+            }
+        }
+    }
 }
+

@@ -17,71 +17,66 @@ if ([string]::IsNullOrWhiteSpace($OutputPath)) {
     $out = [System.IO.Path]::GetFullPath((Join-Path $root $OutputPath))
 }
 
-$csc = "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+$dirs = @(
+    "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319",
+    "$env:WINDIR\Microsoft.NET\Framework\v4.0.30319"
+)
 
-if (-not (Test-Path -LiteralPath $csc)) {
-    $csc = "$env:WINDIR\Microsoft.NET\Framework\v4.0.30319\csc.exe"
+$compiler = $null
+foreach ($d in $dirs) {
+    $c = Join-Path $d "csc.exe"
+    if (Test-Path -LiteralPath $c) { $compiler = $c; break }
 }
-
-if (-not (Test-Path -LiteralPath $csc)) {
-    throw "Cannot find .NET Framework C# compiler."
+if (-not $compiler) {
+    $found = Get-ChildItem -Path "$env:WINDIR\Microsoft.NET" -Filter "csc.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($found) { $compiler = $found.FullName }
 }
+if (-not $compiler) { throw "Cannot find .NET Framework C# compiler." }
 
-if (-not (Test-Path -LiteralPath $src)) {
-    throw "Cannot find source file: $src"
-}
+function Resolve-Assembly($name) {
+    $file = $name + ".dll"
+    $framework = Join-Path "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319" $file
+    if (Test-Path -LiteralPath $framework) { return $framework }
 
-if (-not (Test-Path -LiteralPath $icon)) {
-    throw "Cannot find app icon: $icon"
+    $roots = @(
+        "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\WPF",
+        "$env:WINDIR\Microsoft.NET\Framework\v4.0.30319\WPF",
+        "$env:WINDIR\Microsoft.NET\assembly\GAC_MSIL",
+        "${env:ProgramFiles(x86)}\Reference Assemblies\Microsoft\Framework\.NETFramework"
+    )
+    foreach ($r in $roots) {
+        if (-not (Test-Path -LiteralPath $r)) { continue }
+        $hit = Get-ChildItem -Path $r -Filter $file -Recurse -ErrorAction SilentlyContinue |
+               Where-Object { $_.FullName -notmatch "v3\.5|\\amd64|\\x86|\\ia64" } |
+               Sort-Object { $_.FullName.Length } |
+               Select-Object -First 1
+        if ($hit) { return $hit.FullName }
+    }
+    return $null
 }
 
 $outputDirectory = Split-Path -Parent $out
 New-Item -ItemType Directory -Force -Path $outputDirectory | Out-Null
 
-# Older source snapshots may still contain a placeholder repository address.
-# Normalize those values in a temporary generated file so a build never edits
-# the tracked source tree.
-$generatedSrc = Join-Path ([System.IO.Path]::GetTempPath()) (
-    "WindowLayoutLauncher.generated.{0}.cs" -f ([Guid]::NewGuid().ToString("N"))
-)
-
-try {
-    $sourceText = Get-Content -LiteralPath $src -Raw -Encoding UTF8
-    $sourceText = $sourceText.Replace(
-        "https://github.com/yourusername/WindowLayoutLauncher",
-        "https://github.com/zwmopen/WindowLayoutLauncher"
-    )
-    $sourceText = $sourceText.Replace(
-        "https://raw.githubusercontent.com/yourusername/WindowLayoutLauncher/main/version.json",
-        "https://raw.githubusercontent.com/zwmopen/WindowLayoutLauncher/main/version.json"
-    )
-    $sourceText = $sourceText.Replace(
-        "https://github.com/zwmopen/skills/tree/main/tools/window-layout-launcher",
-        "https://github.com/zwmopen/WindowLayoutLauncher"
-    )
-    $sourceText = $sourceText.Replace(
-        "https://raw.githubusercontent.com/zwmopen/skills/main/tools/window-layout-launcher/version.json",
-        "https://raw.githubusercontent.com/zwmopen/WindowLayoutLauncher/main/version.json"
-    )
-    Set-Content -LiteralPath $generatedSrc -Value $sourceText -Encoding UTF8
-
-    & $csc /nologo /target:winexe /platform:anycpu /optimize+ /win32icon:$icon /out:$out `
-        /reference:System.Windows.Forms.dll `
-        /reference:System.Drawing.dll `
-        /reference:System.Runtime.Serialization.dll `
-        /reference:Microsoft.CSharp.dll `
-        $generatedSrc
-
-    if ($LASTEXITCODE -ne 0) {
-        throw "Build failed."
-    }
+if (-not (Test-Path -LiteralPath $src)) {
+    throw "Cannot find source file: $src"
 }
-finally {
-    Remove-Item -LiteralPath $generatedSrc -Force -ErrorAction SilentlyContinue
+if (-not (Test-Path -LiteralPath $icon)) {
+    throw "Cannot find app icon: $icon"
 }
 
-if (-not (Test-Path -LiteralPath $out)) {
-    throw "Build completed without producing: $out"
+$refs = @("System.Windows.Forms", "System.Drawing", "System.Runtime.Serialization", "System.Management", "UIAutomationClient", "UIAutomationTypes", "Microsoft.CSharp")
+$refArgs = @()
+foreach ($r in $refs) {
+    $p = Resolve-Assembly $r
+    if (-not $p) { throw "Cannot locate assembly: $r" }
+    $refArgs += ("/reference:" + $p)
+}
+
+& $compiler /nologo /target:winexe /platform:anycpu /optimize+ /win32icon:"$icon" /out:"$out" $refArgs "$src"
+
+if ($LASTEXITCODE -ne 0) {
+    throw "Build failed."
 }
 
 Write-Output "Built=$out"

@@ -1,6 +1,6 @@
-{
-    "version": "2.1.0",
-    "download_url": "https://github.com/zwmopen/WindowLayoutLauncher/releases/download/v2.1.0/窗口布局启动器.exe",
-    "release_notes": "v2.1.0 更新内容:\n\n1. 新增程序内日志与诊断查看器，可直接读取恢复、崩溃和更新日志\n2. 恢复布局日志增加毫秒级文件名与结构化运行记录，避免同秒覆盖\n3. 更新检查和下载移到后台线程，网络波动不再卡住主界面\n4. 更新文件增加 GitHub 地址校验、MZ 文件校验与可选 SHA-256 校验\n5. 更新替换改为带时间戳备份，失败时自动回滚并保留备份\n6. 修正源码中的正式仓库地址，并补齐稳定版/开发版双入口",
-    "published_at": "2026-09-11"
+﻿{
+  "version": "3.1.0",
+  "download_url": "https://github.com/zwmopen/WindowLayoutLauncher/releases/download/v3.1.0/窗口布局启动器.exe",
+  "release_notes": "3.1.0 更新内容:\n\n1. 支持多用户配置自动保存与恢复：完美识别 Chrome/Edge 多配置目录（Profile 1、Profile 2、Default 等）与比特浏览器环境，避免串号与抢窗\n2. 自动记忆当前标签页网址：保存布局时精确抓取每个窗口活跃标签页网址\n3. 多标签页深度记忆与按序恢复：支持记录整个窗口的多个标签页\n4. 新增“网页地址”编辑入口：主界面支持直观查看与编辑每个浏览器窗口绑定的多行网址\n5. 智能实例感知：优先复用已存在的对应配置窗口并平滑挪移分屏，未打开时通过专线参数秒级唤醒",
+  "published_at": "2026-11-03"
 }

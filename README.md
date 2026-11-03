@@ -1,4 +1,4 @@
-# 窗口布局启动器
+﻿# 窗口布局启动器
 
 <p align="center">
   <strong>专为 Windows 极客与多屏工作流打造的桌面环境记忆与毫秒级自愈复原中枢</strong><br>
@@ -6,7 +6,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/版本-2.1.0-blue.svg" alt="版本 2.1.0" />
+  <img src="https://img.shields.io/badge/版本-3.1.0-blue.svg" alt="版本 3.1.0" />
   <img src="https://img.shields.io/badge/平台-Windows%2010%20%2F%2011%20(64位)-brightgreen.svg" alt="平台" />
   <img src="https://img.shields.io/badge/核心技术-Win32%20API%20%2B%20Shell%20COM-orange.svg" alt="核心技术" />
   <img src="https://img.shields.io/badge/运行依赖-零外部依赖%20(系统内置)-blueviolet.svg" alt="运行依赖" />
@@ -176,3 +176,4 @@ cd WindowLayoutLauncher
 | 日期 (时间) | 执行者 | 记录 |
 |---|---|---|
 | 2026-09-17 23:11 | 💻 本地 PC / 反重力 | 初始化创建文档并补齐变更记录历史 |
+
