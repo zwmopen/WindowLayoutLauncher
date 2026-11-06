@@ -1,4 +1,4 @@
-﻿# 窗口布局启动器
+# 窗口管理器（原窗口布局启动器）
 
 <p align="center">
   <strong>专为 Windows 极客与多屏工作流打造的桌面环境记忆与毫秒级自愈复原中枢</strong><br>
@@ -6,7 +6,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/版本-3.1.0-blue.svg" alt="版本 3.1.0" />
+  <img src="https://img.shields.io/badge/版本-3.2.0-blue.svg" alt="版本 3.2.0" />
   <img src="https://img.shields.io/badge/平台-Windows%2010%20%2F%2011%20(64位)-brightgreen.svg" alt="平台" />
   <img src="https://img.shields.io/badge/核心技术-Win32%20API%20%2B%20Shell%20COM-orange.svg" alt="核心技术" />
   <img src="https://img.shields.io/badge/运行依赖-零外部依赖%20(系统内置)-blueviolet.svg" alt="运行依赖" />
@@ -68,7 +68,7 @@ graph LR
 
 ### 1. 捕获保存当前工作区
 1. 将当前需要协同的文件资源管理器、浏览器、IDE、聊天窗口调整到满意的位置与大小；
-2. 双击运行 `窗口布局启动器.exe`；
+2. 双击运行 `窗口管理器.exe`；
 3. 点击右侧 **“保存为新布局”**，输入具有业务含义的名称（例如：`多屏AI研发工作区`、`日常写作协同`）。
 
 ### 2. 毫秒级一键唤醒复原
@@ -160,7 +160,7 @@ cd WindowLayoutLauncher
 ```
 
 * **编译器**：系统内置 .NET Framework 4.0 64位 C# 编译器 (`csc.exe`)；
-* **构建产物**：编译成功后自动输出至 `release/窗口布局启动器.exe`；
+* **构建产物**：编译成功后自动输出至 `release/窗口管理器.exe`；
 * **代码维护**：主代码集中于 [`src/WindowLayoutLauncher.cs`](src/WindowLayoutLauncher.cs)，设计规范遵循轻拟态悬浮标准。
 
 ---
