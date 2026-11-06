@@ -18,8 +18,8 @@ namespace WindowLayoutLauncher
 {
     static class Program
     {
-        public const string Version = "3.1.0";
-        public const string AppName = "窗口布局启动器";
+        public const string Version = "3.2.0";
+        public const string AppName = "窗口管理器";
         public const string RepoUrl = "https://github.com/zwmopen/WindowLayoutLauncher";
         public const string VersionCheckUrl = "https://raw.githubusercontent.com/zwmopen/WindowLayoutLauncher/main/version.json";
         public static readonly int ShowMainWindowMessage = Native.RegisterWindowMessage("WindowLayoutLauncher.ShowMainWindow.v3");
@@ -102,7 +102,7 @@ namespace WindowLayoutLauncher
                 WriteCrashLog(ex);
                 if (args.Length == 0)
                 {
-                    MessageBox.Show("窗口布局启动器遇到错误，已写入 crash.log。", "窗口布局启动器", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    MessageBox.Show(AppName + "遇到错误，已写入 crash.log。", AppName, MessageBoxButtons.OK, MessageBoxIcon.Error);
                 }
             }
         }
@@ -553,6 +553,40 @@ namespace WindowLayoutLauncher
             logLines.Add("时间: " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
             logLines.Add("");
 
+            // 先把当前所有浏览器窗口已经打开的网页收进来：已经开着的网址不再重复打开
+            var openUrls = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if ((layout.Items ?? new List<LayoutItem>()).Any(i => EqualsIgnoreCase(i.Kind, "browser")))
+            {
+                // 最小化的浏览器窗口也算：它们里面的网址同样已经开着；非浏览器窗口直接跳过，省得白读
+                var handles = topWindows
+                    .Where(w => BrowserProbe.IsBrowserProcessName(w.ProcessName))
+                    .Select(w => w.Hwnd)
+                    .ToList();
+                try
+                {
+                    foreach (var pair in BrowserProbe.ReadActiveUrls(handles, 2500))
+                    {
+                        var key = UrlKey(pair.Value);
+                        if (key.Length > 0) openUrls.Add(key);
+                    }
+                    foreach (var pair in BrowserProbe.ReadAllTabUrlsForWindows(handles, 10, 8000))
+                    {
+                        foreach (var url in pair.Value)
+                        {
+                            var key = UrlKey(url);
+                            if (key.Length > 0) openUrls.Add(key);
+                        }
+                    }
+                }
+                catch
+                {
+                }
+                var keyList = openUrls.OrderBy(k => k).Take(8).ToList();
+                logLines.Add("已打开的网页: " + openUrls.Count + " 个（恢复时不会重复打开）" +
+                             (keyList.Count > 0 ? "：" + string.Join("、", keyList) : ""));
+                logLines.Add("");
+            }
+
             int idx = 0;
             foreach (var item in layout.Items ?? new List<LayoutItem>())
             {
@@ -569,7 +603,7 @@ namespace WindowLayoutLauncher
                 }
                 else if (EqualsIgnoreCase(item.Kind, "browser"))
                 {
-                    hwnd = FindOrOpenBrowser(item, topWindows, used, out failReason);
+                    hwnd = FindOrOpenBrowser(item, topWindows, used, openUrls, out failReason);
                 }
                 else if (EqualsIgnoreCase(item.Kind, "app"))
                 {
@@ -582,6 +616,14 @@ namespace WindowLayoutLauncher
 
                 if (hwnd == IntPtr.Zero)
                 {
+                    // 托盘常驻程序已在运行、没有可摆的窗口：只提示，不算失败
+                    if (failReason != null && failReason.StartsWith("INFO:", StringComparison.Ordinal))
+                    {
+                        var note = failReason.Substring(5);
+                        logLines.Add("    ○ " + note);
+                        continue;
+                    }
+
                     failed++;
                     var detail = itemDesc + " → " + (failReason ?? "未找到窗口");
                     failDetails.Add(detail);
@@ -594,7 +636,7 @@ namespace WindowLayoutLauncher
                 {
                     ok++;
                     used.Add(hwnd);
-                    logLines.Add("    ✓ 已移动到 (" + target.X + "," + target.Y + ") " + target.Width + "x" + target.Height);
+                    logLines.Add("    ✓ 已移动到 (" + target.X + "," + target.Y + ") " + target.Width + "x" + target.Height + "（窗口: " + GetWindowTitleSafe(hwnd) + "）");
                 }
                 else
                 {
@@ -632,6 +674,18 @@ namespace WindowLayoutLauncher
                 Message = failed > 0 ? "已恢复 " + ok + "，失败 " + failed : "已恢复窗口布局 " + ok,
                 FailDetails = failDetails
             };
+        }
+
+        private static string GetWindowTitleSafe(IntPtr hwnd)
+        {
+            try
+            {
+                if (hwnd == IntPtr.Zero) return "";
+                var builder = new StringBuilder(256);
+                if (Native.GetWindowText(hwnd, builder, builder.Capacity) <= 0) return "";
+                return builder.ToString();
+            }
+            catch { return ""; }
         }
 
         private static string DescribeItem(LayoutItem item)
@@ -853,7 +907,7 @@ namespace WindowLayoutLauncher
             return created.Hwnd;
         }
 
-        private IntPtr FindOrOpenBrowser(LayoutItem item, List<WindowInfo> existing, HashSet<IntPtr> used, out string failReason)
+        private IntPtr FindOrOpenBrowser(LayoutItem item, List<WindowInfo> existing, HashSet<IntPtr> used, HashSet<string> openUrls, out string failReason)
         {
             failReason = null;
             var family = string.IsNullOrWhiteSpace(item.Browser) ? "other" : item.Browser;
@@ -862,7 +916,16 @@ namespace WindowLayoutLauncher
             {
                 processName = System.IO.Path.GetFileNameWithoutExtension(item.ExePath);
             }
-            var urls = item.UrlList;
+            var allUrls = item.UrlList;
+
+            // 已经开着的不再打开，只补真正缺的那几个
+            var urls = new List<string>();
+            foreach (var u in allUrls)
+            {
+                var key = UrlKey(u);
+                if (key.Length > 0 && openUrls != null && openUrls.Contains(key)) continue;
+                urls.Add(u);
+            }
             var profile = (item.Profile ?? "").Trim();
             var keyword = string.IsNullOrWhiteSpace(item.TitleKeyword) ? (item.Title ?? "") : item.TitleKeyword;
             var label = BrowserProbe.FamilyLabel(family) + (string.IsNullOrWhiteSpace(item.ProfileName) ? (string.IsNullOrWhiteSpace(profile) ? "" : " / " + profile) : " / " + item.ProfileName);
@@ -917,17 +980,17 @@ namespace WindowLayoutLauncher
                 }
             }
 
-            if (found == null && candidates.Count > 0)
+            // 标题/域名兜底只给“没有写明配置”的条目用：写明了配置却去抢别的窗口，
+            // 会把别的配置的窗口挪走，比新开一个正确配置的窗口糟糕得多
+            if (found == null && candidates.Count > 0 &&
+                string.IsNullOrWhiteSpace(profile) && string.IsNullOrWhiteSpace(profileName))
             {
                 var domain = GetDomain(urls.Count > 0 ? urls[0] : item.Url);
                 found = candidates.FirstOrDefault(w =>
                 {
                     // 已经识别出别的配置的窗口不能抢，否则多开时会张冠李戴
-                    if (!string.IsNullOrWhiteSpace(profile) || !string.IsNullOrWhiteSpace(profileName))
-                    {
-                        var info = BrowserProbe.Probe(w.ProcessId, w.ExePath, w.Title, w.Hwnd);
-                        if (info != null && (!string.IsNullOrWhiteSpace(info.Profile) || !string.IsNullOrWhiteSpace(info.ProfileName))) return false;
-                    }
+                    var info = BrowserProbe.Probe(w.ProcessId, w.ExePath, w.Title, w.Hwnd);
+                    if (info != null && (!string.IsNullOrWhiteSpace(info.Profile) || !string.IsNullOrWhiteSpace(info.ProfileName))) return false;
                     return (!string.IsNullOrWhiteSpace(keyword) && ContainsIgnoreCase(w.Title, keyword)) ||
                            (!string.IsNullOrWhiteSpace(domain) && ContainsIgnoreCase(w.Title, domain));
                 });
@@ -935,12 +998,39 @@ namespace WindowLayoutLauncher
 
             if (found != null)
             {
-                var openedUrl = BrowserProbe.ReadActiveUrl(found.Hwnd);
+                // 复用窗口时，这个窗口里“所有标签页”的网址都算已经打开，不只是当前显示的那一页。
+                // 否则保存的网址正好开在后台标签里时，会被当成没开过而重复开一遍。
+                var windowKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var openedKey = UrlKey(BrowserProbe.ReadActiveUrl(found.Hwnd));
+                if (openedKey.Length > 0) windowKeys.Add(openedKey);
+                try
+                {
+                    foreach (var tabUrl in BrowserProbe.ReadAllTabUrls(found.Hwnd, 20, 6000))
+                    {
+                        var tabKey = UrlKey(tabUrl);
+                        if (tabKey.Length > 0) windowKeys.Add(tabKey);
+                    }
+                }
+                catch { }
                 var pending = urls
-                    .Where(u => !string.Equals(u, openedUrl, StringComparison.OrdinalIgnoreCase))
+                    .Where(u => !windowKeys.Contains(UrlKey(u)))
                     .ToList();
-                if (pending.Count > 0) OpenBrowserTabs(family, item, found.Hwnd, pending);
+                if (pending.Count > 0)
+                {
+                    OpenBrowserTabs(family, item, found.Hwnd, pending);
+                    if (openUrls != null)
+                    {
+                        foreach (var u in pending) openUrls.Add(UrlKey(u));
+                    }
+                }
                 return found.Hwnd;
+            }
+
+            // 网址全都已经开着、又没有对应配置的窗口：不用再开新窗口
+            if (allUrls.Count > 0 && urls.Count == 0)
+            {
+                failReason = "INFO:这 " + allUrls.Count + " 个网页已经在其它窗口打开，跳过";
+                return IntPtr.Zero;
             }
 
             // 2) 打开新窗口
@@ -961,8 +1051,21 @@ namespace WindowLayoutLauncher
                     .OrderBy(w => w.X).ThenBy(w => w.Y)
                     .FirstOrDefault();
                 if (fresh != null) return fresh;
+                // 新窗口没等到时的兜底：排除本来就在的窗口，且带配置的条目
+                // 只认“配置对得上”的窗口，避免把别的配置的窗口挪走
                 return latest
-                    .Where(w => !used.Contains(w.Hwnd) && IsSameBrowserFamily(w, family, processName))
+                    .Where(w => !before.Contains(w.Hwnd) && !used.Contains(w.Hwnd) && IsSameBrowserFamily(w, family, processName))
+                    .Where(w =>
+                    {
+                        if (string.IsNullOrWhiteSpace(profile) && string.IsNullOrWhiteSpace(profileName)) return true;
+                        var info = BrowserProbe.Probe(w.ProcessId, w.ExePath, w.Title, w.Hwnd);
+                        if (info == null) return false;
+                        if (!string.IsNullOrWhiteSpace(profile) &&
+                            string.Equals((info.Profile ?? "").Trim(), profile, StringComparison.OrdinalIgnoreCase)) return true;
+                        if (!string.IsNullOrWhiteSpace(profileName) && !string.IsNullOrWhiteSpace(info.ProfileName) &&
+                            BrowserProbe.NamesCompatible(info.ProfileName, profileName)) return true;
+                        return false;
+                    })
                     .Where(w => string.IsNullOrWhiteSpace(keyword) || ContainsIgnoreCase(w.Title, keyword))
                     .OrderBy(w => w.X).ThenBy(w => w.Y)
                     .FirstOrDefault();
@@ -974,13 +1077,15 @@ namespace WindowLayoutLauncher
                 return IntPtr.Zero;
             }
 
-            // 比特浏览器环境打开后只带一个空白/上次页面，其余网址用地址栏补上
+            // 比特浏览器环境打开后只带一个空白/上次页面：第一个网址用当前页，其余开新标签，不能互相顶掉
             if (string.Equals(family, "bit", StringComparison.OrdinalIgnoreCase) && urls.Count > 0)
             {
                 Thread.Sleep(600);
+                var firstBit = true;
                 foreach (var url in urls)
                 {
-                    Native.NavigateInWindow(created.Hwnd, url);
+                    Native.NavigateInWindow(created.Hwnd, url, !firstBit);
+                    firstBit = false;
                 }
             }
             return created.Hwnd;
@@ -1124,7 +1229,13 @@ namespace WindowLayoutLauncher
         {
             if (EqualsIgnoreCase(family, "bit"))
             {
-                foreach (var url in urls) Native.NavigateInWindow(hwnd, url);
+                // 第一个网址用当前页打开，其余开新标签；逐个在当前页输入会把前面的顶掉
+                var firstBit = true;
+                foreach (var url in urls)
+                {
+                    Native.NavigateInWindow(hwnd, url, !firstBit);
+                    firstBit = false;
+                }
                 return;
             }
 
@@ -1169,15 +1280,33 @@ namespace WindowLayoutLauncher
             bool isUwp = !string.IsNullOrWhiteSpace(item.ExePath) &&
                          ContainsIgnoreCase(item.ExePath, "\\WindowsApps\\");
 
+            var before = new HashSet<IntPtr>(existing
+                .Where(w => IsSameAppWindow(w, processName, exePath))
+                .Select(w => w.Hwnd));
+
+            // 程序已经在跑（桌面整理这类托盘常驻工具最常见）：不再启动重复实例，也不再干等窗口。
+            // 有主窗口就直接拿来摆位；没有窗口就给一条提示，不算失败。
+            if (!string.IsNullOrWhiteSpace(processName))
+            {
+                var running = Process.GetProcessesByName(processName);
+                if (running.Length > 0)
+                {
+                    foreach (var proc in running)
+                    {
+                        var handle = GetMainWindowHandleSafe(proc);
+                        if (handle == IntPtr.Zero || used.Contains(handle) || before.Contains(handle)) continue;
+                        return handle;
+                    }
+                    failReason = "INFO:程序已在运行，但没有可摆放的窗口（托盘常驻工具）";
+                    return IntPtr.Zero;
+                }
+            }
+
             if (!hasExe && !isUwp && string.IsNullOrWhiteSpace(processName))
             {
                 failReason = "程序路径不存在且无进程名: " + (item.ExePath ?? "(空)");
                 return IntPtr.Zero;
             }
-
-            var before = new HashSet<IntPtr>(existing
-                .Where(w => IsSameAppWindow(w, processName, exePath))
-                .Select(w => w.Hwnd));
 
             bool launched = false;
             string launchError = null;
@@ -1348,6 +1477,20 @@ namespace WindowLayoutLauncher
             catch { return ""; }
         }
 
+        /// <summary>把网址化成可比较的键：忽略协议、www、末尾斜杠和大小写。</summary>
+        private static string UrlKey(string url)
+        {
+            var value = BrowserProbe.NormalizeUrl(url);
+            if (string.IsNullOrWhiteSpace(value)) return "";
+            value = value.Trim();
+
+            var scheme = value.IndexOf("://", StringComparison.Ordinal);
+            if (scheme > 0) value = value.Substring(scheme + 3);
+            if (value.StartsWith("www.", StringComparison.OrdinalIgnoreCase)) value = value.Substring(4);
+            value = value.TrimEnd('/');
+            return value.ToLowerInvariant();
+        }
+
         private static string FullPathTrim(string path)
         {
             try { return System.IO.Path.GetFullPath(path).TrimEnd('\\'); }
@@ -1381,6 +1524,9 @@ namespace WindowLayoutLauncher
 
             if (ignoredProcesses.Contains(processName)) return true;
             if (!string.IsNullOrWhiteSpace(exePath) && EqualsIgnoreCase(FullPathTrim(exePath), currentExe)) return true;
+
+            // 浏览器进程里剩下的窗口都是气泡/对话框（“翻译此页？”之类），不是真正的应用窗口
+            if (BrowserProbe.IsBrowserProcessName(processName)) return true;
             return false;
         }
 
@@ -1668,6 +1814,14 @@ namespace WindowLayoutLauncher
         };
 
         private static readonly Dictionary<string, bool> ChromiumDirCache = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>是不是标准浏览器进程（用来区分“浏览器自己的气泡窗口”和“普通应用”）。</summary>
+        public static bool IsBrowserProcessName(string processName)
+        {
+            if (string.IsNullOrWhiteSpace(processName)) return false;
+            if (ChromiumProcessNames.Contains(processName)) return true;
+            return EqualsIgnoreCase(processName, "firefox") || EqualsIgnoreCase(processName, "iexplore");
+        }
 
         public static string FamilyLabel(string family)
         {
@@ -2637,7 +2791,7 @@ namespace WindowLayoutLauncher
             return value.Length <= max ? value : value.Substring(0, max);
         }
 
-        private static string NormalizeUrl(string url)
+        public static string NormalizeUrl(string url)
         {
             if (string.IsNullOrWhiteSpace(url)) return null;
             var value = url.Trim();
@@ -3169,6 +3323,12 @@ namespace WindowLayoutLauncher
         /// <summary>把窗口激活后，用地址栏打开一个网址（比特浏览器等无法用命令行加标签时使用）。</summary>
         public static void NavigateInWindow(IntPtr hwnd, string url)
         {
+            NavigateInWindow(hwnd, url, false);
+        }
+
+        /// <summary>在窗口里打开网址。newTab=true 时先 Ctrl+T 开新标签，避免把当前页顶掉。</summary>
+        public static void NavigateInWindow(IntPtr hwnd, string url, bool newTab)
+        {
             if (hwnd == IntPtr.Zero || string.IsNullOrWhiteSpace(url)) return;
             try
             {
@@ -3176,6 +3336,11 @@ namespace WindowLayoutLauncher
                 Thread.Sleep(140);
                 if (!ForceForeground(hwnd)) return;
                 Thread.Sleep(80);
+                if (newTab)
+                {
+                    SendKeys.SendWait("^t");
+                    Thread.Sleep(280);
+                }
                 SendKeys.SendWait("^l");
                 Thread.Sleep(130);
 
@@ -3285,7 +3450,7 @@ namespace WindowLayoutLauncher
                 }
 
                 IObjectCollection tasks = (IObjectCollection)new EnumerableObjectCollection();
-                tasks.AddObject(CreateLink("打开布局中心", ""));
+                tasks.AddObject(CreateLink("打开窗口管理器", ""));
                 destination.AddUserTasks((IObjectArray)tasks);
                 ReleaseComObject(tasks);
 
@@ -3704,7 +3869,7 @@ namespace WindowLayoutLauncher
         private void Initialize()
         {
             AutoScaleMode = AutoScaleMode.None;
-            Text = "窗口布局启动器";
+            Text = Program.AppName;
             StartPosition = FormStartPosition.CenterScreen;
             ClientSize = new Size(820, 650);
             MinimumSize = new Size(640, 500);
@@ -3729,7 +3894,7 @@ namespace WindowLayoutLauncher
             Controls.Add(root);
 
             titleLabel = new Label();
-            titleLabel.Text = "窗口布局中心";
+            titleLabel.Text = "窗口管理器";
             titleLabel.Dock = DockStyle.Fill;
             titleLabel.Font = new Font("Microsoft YaHei UI", 14.5F, FontStyle.Bold);
             titleLabel.ForeColor = UiTheme.Ink;
@@ -3950,7 +4115,7 @@ namespace WindowLayoutLauncher
             trayMenu = new ContextMenuStrip();
             trayMenu.Font = new Font("Microsoft YaHei UI", 9F);
             trayIcon = new NotifyIcon();
-            trayIcon.Text = "窗口布局启动器";
+            trayIcon.Text = Program.AppName;
             trayIcon.Icon = Icon ?? Icon.ExtractAssociatedIcon(Application.ExecutablePath);
             trayIcon.ContextMenuStrip = trayMenu;
             trayIcon.Visible = true;
@@ -3962,7 +4127,7 @@ namespace WindowLayoutLauncher
         {
             if (trayMenu == null) return;
             trayMenu.Items.Clear();
-            trayMenu.Items.Add("打开窗口布局中心", null, (s, e) => ShowMainWindow());
+            trayMenu.Items.Add("打开窗口管理器", null, (s, e) => ShowMainWindow());
             trayMenu.Items.Add(new ToolStripSeparator());
             var layouts = manager.GetLayouts();
             foreach (var layout in layouts)
@@ -4635,11 +4800,11 @@ namespace WindowLayoutLauncher
                 var currentExe = Application.ExecutablePath;
                 var dir = Path.GetDirectoryName(currentExe);
                 var batPath = Path.Combine(dir, "update.bat");
-                var oldExeBackup = Path.Combine(dir, "窗口布局启动器_old.exe");
+                var oldExeBackup = Path.Combine(dir, "窗口管理器_old.exe");
 
                 var sb = new StringBuilder();
                 sb.AppendLine("@echo off");
-                sb.AppendLine("echo 正在更新窗口布局启动器...");
+                sb.AppendLine("echo 正在更新窗口管理器...");
                 sb.AppendLine("timeout /t 2 /nobreak >nul");
                 sb.AppendLine("if exist \"" + oldExeBackup + "\" del \"" + oldExeBackup + "\"");
                 sb.AppendLine("ren \"" + currentExe + "\" \"" + Path.GetFileName(oldExeBackup) + "\"");
@@ -4831,7 +4996,7 @@ namespace WindowLayoutLauncher
 
             versionLabel = new Label
             {
-                Text = "版本 v" + Program.Version + "  ·  Windows 桌面工作启动器",
+                Text = "版本 v" + Program.Version + "  ·  窗口 · 浏览器配置 · 网页一键还原",
                 Dock = DockStyle.Fill,
                 Font = new Font("Microsoft YaHei UI", 9.5F),
                 ForeColor = UiTheme.Muted,
@@ -4978,7 +5143,7 @@ namespace WindowLayoutLauncher
         {
             var tempDir = Path.Combine(Path.GetTempPath(), "WLL_Update");
             Directory.CreateDirectory(tempDir);
-            var newExe = Path.Combine(tempDir, "窗口布局启动器_new.exe");
+            var newExe = Path.Combine(tempDir, "窗口管理器_new.exe");
 
             var progressForm = new Form();
             progressForm.Text = "正在下载更新";
